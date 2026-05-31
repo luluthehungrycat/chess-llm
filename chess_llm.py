@@ -521,6 +521,14 @@ class LLMPlayer:
         if self.tiny:
             return self._build_tiny_system(board)
 
+        # DeepSeek V3 (big-pickle) reasoning scales to fill max_tokens.
+        # With the full prompt (FEN + history + long legal-move list),
+        # the model's analysis doubles each move — by move 5-7 it
+        # exhausts even 16K tokens and produces nothing. The compact
+        # prompt strips the reasoning triggers while keeping tools.
+        if "big-pickle" in self.model and self.model.startswith("bigpickle/"):
+            return self._build_tiny_system(board)
+
         color = "White" if board.turn == chess.WHITE else "Black"
         # Build legal moves in both UCI and SAN — smaller models benefit from
         # seeing the same format they're expected to output.
@@ -555,12 +563,24 @@ class LLMPlayer:
         Pick ONE UCI move from the list below.
         Do NOT guess from memory — the board may have changed.
 
-        Legal UCI moves: {', '.join(capped)}
+        Legal UCI moves: {{moves}}
 
-        Output exactly: MOVE: <uci>
-        Example: MOVE: {capped[0]}
+        {{instruction}}
+        {{example}}
 
-        Nothing else. No explanation.""")
+        Nothing else. No explanation.""").format(
+            moves=", ".join(capped),
+            instruction=(
+                "Call the make_move tool with your chosen UCI."
+                if self.use_tools
+                else "Output exactly: MOVE: <uci>"
+            ),
+            example=(
+                ""
+                if self.use_tools
+                else f"Example: MOVE: {capped[0]}"
+            ),
+        )
 
     _TOOLS = [{
         "type": "function",
@@ -1324,11 +1344,18 @@ def main():
     tools_label = "off" if args.no_tools or args.tiny else "on"
     if args.tiny:
         tools_label += " (tiny mode)"
+    # Detect auto-compact prompt for verbose reasoning models
+    _auto_compact = False
+    for p in (white, black):
+        if hasattr(p, "model") and "big-pickle" in p.model and p.model.startswith("bigpickle/"):
+            if not args.tiny and not args.no_tools:
+                _auto_compact = True
+    prompt_style = "compact (reasoning model)" if _auto_compact else "full"
     print(f"\n♟  LLM Chess Match")
     print(f"   White: {white.name}")
     print(f"   Black: {black.name}")
     print(f"   Delay: {args.delay}s  |  Retries: {args.retries}  |  "
-          f"Tools: {tools_label}")
+          f"Tools: {tools_label}  |  Prompt: {prompt_style}")
 
     match = ChessMatch(white, black, delay=args.delay)
     result = match.play()
