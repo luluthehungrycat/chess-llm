@@ -272,6 +272,10 @@ def _apply_reasoning(kwargs: dict, model: str, level: str) -> None:
     # OpenAI / OpenRouter / OpenCode / DeepSeek — use reasoning_effort
     # (also works for openrouter/anthropic/... via OpenRouter's API)
     kwargs["reasoning_effort"] = level
+    # litellm's OpenAI-compatible handler rejects unknown params by default.
+    # When routing through a proxy or custom endpoint (bigpickle/, ollama/, etc.),
+    # we need to whitelist reasoning_effort so litellm passes it through.
+    kwargs.setdefault("allowed_openai_params", []).append("reasoning_effort")
 
 
 # ── Move extraction ──────────────────────────────────────────────────────────
