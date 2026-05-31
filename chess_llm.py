@@ -246,6 +246,19 @@ def _call_llm(
             }
             for tc in choice.tool_calls
         ]
+    # Expose finish_reason + token usage for debug logging.
+    # finish_reason="length" is the key signal that the model hit
+    # max_tokens before producing output (common with reasoning models).
+    result["finish_reason"] = response.choices[0].finish_reason
+    try:
+        u = response.usage
+        result["usage"] = {
+            "prompt": getattr(u, "prompt_tokens", 0),
+            "completion": getattr(u, "completion_tokens", 0),
+            "total": getattr(u, "total_tokens", 0),
+        }
+    except Exception:
+        result["usage"] = {}
     return result
 
 
@@ -627,7 +640,12 @@ class LLMPlayer:
 
             # Debug: show what the model returned
             if DEBUG:
-                print(f"  🔍 {self.name} response (attempt {attempt}):")
+                usage = result.get("usage", {})
+                fr = result.get("finish_reason", "?")
+                tokens = f"in={usage.get('prompt','?')} out={usage.get('completion','?')}"
+                mark = " ⚠️ LENGTH" if fr == "length" else ""
+                print(f"  🔍 {self.name} response (attempt {attempt}): "
+                      f"finish={fr}{mark} | {tokens}")
                 if tool_calls:
                     print(f"     tool_calls: {tool_calls}")
                 if content:
