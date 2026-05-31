@@ -55,11 +55,12 @@ def parse_player_spec(spec: str):
         skill = int(skill_str) if skill_str else 20
         return StockfishPlayer(name=f"Stockfish {skill}", skill_level=skill), f"stockfish-{skill}"
 
-    # LLM player
+    # LLM player (text mode is more reliable for tournaments).
+    # Timeout auto-bump for reasoning models is handled in run_match().
     player = LLMPlayer(
         model=spec,
         name=spec,
-        use_tools=False,  # default for tournaments: text mode is more reliable
+        use_tools=False,
     )
     return player, spec
 
@@ -96,10 +97,14 @@ def run_match(white_spec: str, black_spec: str,
     white, w_id = parse_player_spec(white_spec)
     black, b_id = parse_player_spec(black_spec)
 
-    # Apply kwargs to players (LLM and Stockfish)
+    # Apply kwargs to players (LLM and Stockfish).
+    # Auto-bump timeout for reasoning models through Big Pickle Proxy
+    # (these can take 60-120s for first-token on complex positions).
     for p in (white, black):
         for k, v in player_kwargs.items():
             if hasattr(p, k):
+                if k == "timeout" and hasattr(p, "model") and p.model.startswith("bigpickle/") and v == 120:
+                    v = 240
                 setattr(p, k, v)
 
     # Pre-flight
@@ -368,9 +373,14 @@ def main():
         description="LLM Chess Tournament Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
+               "  # Local models via Docker:\n"
                "  python tournament.py --round-robin stockfish docker/ai/qwen3.5:9B docker/ai/ministral3:3B\n"
                "  python tournament.py --gauntlet docker/ai/qwen3.5:9B --opponents stockfish random\n"
-               "  python tournament.py --round-robin model-a model-b --elo --delay 0",
+               "  # Free cloud models via Big Pickle Proxy:\n"
+               "  python tournament.py --round-robin bigpickle/big-pickle bigpickle/deepseek-v4-flash-free \\\n"
+               "      bigpickle/nemotron-3-super-free bigpickle/mimo-v2.5-free --reasoning low\n"
+               "  python tournament.py --gauntlet bigpickle/big-pickle \\\n"
+               "      --opponents bigpickle/deepseek-v4-flash-free stockfish:0 --elo --delay 0",
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -401,11 +411,11 @@ def main():
     parser.add_argument("--tiny", action="store_true",
                         help="Tiny-model mode: compact UCI-only prompt for models <20B. "
                              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.")
-    parser.add_argument("--reasoning", choices=["low", "medium", "high"],
+    parser.add_argument("--reasoning", choices=["low", "medium", "high", "none"],
                         default=None,
                         help="Reasoning effort for providers that support it "
                              "(OpenRouter/OpenAI: reasoning_effort; Anthropic: thinking budget). "
-                             "Omit for provider default.")
+                             "Use \"none\" to skip reasoning. Omit for provider default.")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--timeout", type=int, default=120)

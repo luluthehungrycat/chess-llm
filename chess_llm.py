@@ -270,7 +270,12 @@ def _apply_reasoning(kwargs: dict, model: str, level: str) -> None:
       - OpenRouter / OpenAI / OpenCode / DeepSeek: reasoning_effort
       - Anthropic: thinking.type + thinking.budget_tokens
       - Ollama / DMR / BigPickle / others: no equivalent (silently skip)
+    
+    If level is "none", skip reasoning entirely — useful for models that
+    support reasoning_effort but you want raw speed (e.g. DeepSeek Flash).
     """
+    if level == "none":
+        return  # skip reasoning, don't set any params
     model_lower = model.lower()
 
     # Budget tokens mapped to reasoning level
@@ -477,6 +482,7 @@ class LLMPlayer:
         self.tiny = tiny
         self.reasoning = reasoning  # None, "low", "medium", "high"
         self.illegal_count = 0  # stats
+        self._timeout_count = 0  # track timeouts for auto-tool-fallback
 
     def check_connectivity(self) -> bool:
         """Quick pre-flight check that the model / API is reachable.
@@ -637,6 +643,10 @@ class LLMPlayer:
                     retry_attempt=empty_retries,
                 )
             except TimeoutError as e:
+                self._timeout_count += 1
+                if self._timeout_count >= 2 and self.use_tools:
+                    print(f"  🔧 {self.name}: {self._timeout_count} timeouts — disabling tools for rest of game")
+                    self.use_tools = False
                 if attempt < self.max_retries:
                     wait = 2 ** attempt + _random.uniform(0, 1)
                     current_timeout = int(current_timeout * 1.5)
@@ -1205,9 +1215,10 @@ def main():
              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.",
     )
     parser.add_argument(
-        "--reasoning", choices=["low", "medium", "high"], default=None,
+        "--reasoning", choices=["low", "medium", "high", "none"], default=None,
         help="Reasoning effort for providers that support it "
-             "(OpenRouter/OpenAI: reasoning_effort; Anthropic: thinking budget).",
+             "(OpenRouter/OpenAI: reasoning_effort; Anthropic: thinking budget). "
+             "Use \"none\" to explicitly disable reasoning for supported models.",
     )
     parser.add_argument(
         "--temperature", "-t", type=float, default=0.3,
@@ -1324,6 +1335,12 @@ def main():
             )
         else:
             name = f"{kwargs['model']} ({color})"
+            # Auto-bump timeout for verbose reasoning models (DeepSeek
+            # variants through Big Pickle Proxy). These models can take
+            # 60-120s to produce their first token when reasoning deeply.
+            effective_timeout = args.timeout
+            if kwargs["model"].startswith("bigpickle/") and effective_timeout == 120:
+                effective_timeout = 240
             return LLMPlayer(
                 model=kwargs["model"],
                 name=name,
@@ -1332,7 +1349,7 @@ def main():
                 max_retries=args.retries,
                 use_tools=not args.no_tools and not args.tiny,
                 temperature=args.temperature,
-                timeout=args.timeout,
+                timeout=effective_timeout,
                 tiny=args.tiny,
                 reasoning=args.reasoning,
             )
