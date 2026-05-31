@@ -184,7 +184,8 @@ def _call_llm(
     # max_tokens. The chess prompt leaves zero tokens for the answer if
     # the model thinks too long. Per-model bumps:
     #   big-pickle (DeepSeek V3):  16384 — very verbose reasoning
-    #   deepseek-v4-flash-free:    2048 — flash model, needs less headroom
+    #   deepseek-v4-flash-free:     16384 — also a reasoning model (supports
+    #                                      reasoning_effort levels)
     #   nemotron-3-super-free,
     #   mimo-v2.5-free:            2048 — embedding reasoning in content
     #                                  (same headroom as flash-free)
@@ -196,7 +197,7 @@ def _call_llm(
         if "big-pickle" in model:
             _floor = 16384
         elif "deepseek" in model:
-            _floor = 2048
+            _floor = 16384
         else:
             _floor = 2048  # nemotron, mimo — inline reasoning in content
         if _mt < _floor:
@@ -521,12 +522,15 @@ class LLMPlayer:
         if self.tiny:
             return self._build_tiny_system(board)
 
-        # DeepSeek V3 (big-pickle) reasoning scales to fill max_tokens.
-        # With the full prompt (FEN + history + long legal-move list),
-        # the model's analysis doubles each move — by move 5-7 it
-        # exhausts even 16K tokens and produces nothing. The compact
-        # prompt strips the reasoning triggers while keeping tools.
-        if "big-pickle" in self.model and self.model.startswith("bigpickle/"):
+        # DeepSeek reasoning models (big-pickle, deepseek-v4-flash-free, etc.)
+        # scale reasoning to fill max_tokens. With the full prompt
+        # (FEN + history + long legal-move list), analysis doubles each
+        # move — by move 5-7 it exhausts even 16K tokens and produces
+        # nothing. The compact prompt strips the reasoning triggers
+        # while keeping tools.
+        if self.model.startswith("bigpickle/") and (
+            "big-pickle" in self.model or "deepseek" in self.model
+        ):
             return self._build_tiny_system(board)
 
         color = "White" if board.turn == chess.WHITE else "Black"
@@ -1345,11 +1349,13 @@ def main():
     if args.tiny:
         tools_label += " (tiny mode)"
     # Detect auto-compact prompt for verbose reasoning models
+    # (big-pickle, deepseek-v4-flash-free, etc.)
     _auto_compact = False
     for p in (white, black):
-        if hasattr(p, "model") and "big-pickle" in p.model and p.model.startswith("bigpickle/"):
-            if not args.tiny and not args.no_tools:
-                _auto_compact = True
+        if hasattr(p, "model") and p.model.startswith("bigpickle/"):
+            if ("big-pickle" in p.model or "deepseek" in p.model):
+                if not args.tiny and not args.no_tools:
+                    _auto_compact = True
     prompt_style = "compact (reasoning model)" if _auto_compact else "full"
     print(f"\n♟  LLM Chess Match")
     print(f"   White: {white.name}")
