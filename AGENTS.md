@@ -56,6 +56,23 @@ LLM_CHESS_DEBUG=1 python chess_llm.py --white random --black random --delay 0
 
 ## Common issues
 
+- **llama.cpp models**: `llama-cpp/` routes through llama-server's OpenAI-compatible `/v1` endpoint (default port 8080). Start with: `llama-server -m model.gguf --port 8080`. No API key needed. Use `--tiny` for quantized models that don't handle tool calling.
+- **Model config system** (`models.yaml` + `model_config.py`): Per-model settings via named presets, inline query flags, and CLI overrides.
+  ```bash
+  # Named presets from models.yaml
+  python chess_llm.py -w @qwen3-local -b @stockfish-0
+  python tournament.py --round-robin @qwen3-local @deepseek-v4-free
+
+  # Inline flags override preset defaults
+  python chess_llm.py -w @qwen3-local?retries=5
+
+  # Per-player CLI flags (for chess_llm.py)
+  python chess_llm.py -w llama-cpp/model --white-flags "tiny=true,retries=10"
+
+  # Global tournament flags merged into all players
+  python tournament.py --round-robin @qwen3-local @big-pickle --model-flags "timeout=180"
+  ```
+  Merge priority (lowest → highest): defaults in models.yaml → named preset → inline `?key=val` → CLI `--white-flags`/`--black-flags`/`--model-flags`
 - **Ollama models**: `ollama/` routes through Ollama's OpenAI-compatible `/v1` endpoint (not litellm's native handler, which has [known tool-calling bugs](https://github.com/BerriAI/litellm/issues/13823)). The model must be pulled (`ollama pull gpt-oss:20b`) and the Ollama server must be running. The default base URL is `http://localhost:11434/v1`; override with `--api-base` if needed.
 - **Docker Model Runner**: `docker/` routes through DMR's OpenAI-compatible `/engines/v1` endpoint (port 12434). Models use the `ai/` namespace — e.g. `docker/ai/ministral3:3B-Q4_K_M`. Default context is 4K tokens for llama.cpp GGUF models; increase with `docker model configure --ctx-size 8192 ai/model-name` before running chess games.
 - **Big Pickle Proxy**: `bigpickle/` routes through the local proxy at `http://localhost:8000/v1` (port 8000). Start the proxy first: `cd bigpickle-proxy && python proxy.py --port 8000`. Free models:

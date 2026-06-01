@@ -22,6 +22,9 @@ Usage:
   python chess_llm.py                          # LLM vs LLM (default models)
   python chess_llm.py --white human            # You play white
   python chess_llm.py --white opencode-go/deepseek-v4-pro --black openrouter/anthropic/claude-sonnet-4
+  python chess_llm.py --white @qwen3-local -b stockfish   # preset from models.yaml
+  python chess_llm.py -w llama-cpp/model?tiny=1&retries=10  # inline flags
+  python chess_llm.py -w @qwen3-local --black-flags "tools=on"  # per-player CLI override
   python chess_llm.py --model opencode-go/deepseek-v4-pro  # both sides same model
   python chess_llm.py --white human --black stockfish      # You vs Stockfish
 """
@@ -34,7 +37,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import chess
 import chess.pgn
@@ -77,6 +80,10 @@ PROVIDER_PRESETS: dict[str, tuple[str, str]] = {
     # NOTE: The proxy strips reasoning_effort from forwarded requests, so
     # --reasoning has no effect through this provider (documented, not an error).
     "bigpickle":    ("http://localhost:8000/v1", None),
+    # llama.cpp server (llama-server) — OpenAI-compatible /v1 endpoint.
+    # Default port is 8080. Start with: llama-server -m model.gguf --port 8080.
+    # No real API key needed; llama-server ignores it but requires non-empty.
+    "llama-cpp":    ("http://localhost:8080/v1", None),
 }
 
 
@@ -109,6 +116,9 @@ def _resolve_provider(model: str) -> tuple[str, str | None, str | None]:
                 api_key = "not-needed"
             # Big Pickle Proxy also doesn't validate API keys
             if prefix == "bigpickle":
+                api_key = "not-needed"
+            # llama.cpp server ignores API keys but requires non-empty
+            if prefix == "llama-cpp":
                 api_key = "not-needed"
             # openrouter is known to litellm natively — keep the prefix
             if prefix == "openrouter":
@@ -1126,41 +1136,66 @@ class ChessMatch:
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def parse_player(spec: str) -> tuple[str, dict]:
+def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
     """
-    Parse a player spec string into (type, kwargs).
+    Parse a player spec string into (type, kwargs) with model config support.
+
+    Handles @preset-name references and inline ?key=val query flags.
+    Returns kwargs for player construction including per-model overrides.
 
     Types:
-      human          — HumanPlayer
-      random         — RandomPlayer
-      model_name     — LLMPlayer with that model
-      ollama/model   — LLMPlayer with Ollama
-      openai/gpt-4o  — LLMPlayer with litellm prefix
+      human / human:NAME    — HumanPlayer
+      random                — RandomPlayer
+      stockfish / stockfish:N — StockfishPlayer
+      @preset-name          — Resolved from models.yaml
+      provider/model        — LLMPlayer (with optional ?flags)
     """
+    from model_config import resolve_model_spec, ModelConfig
+
     spec = spec.strip()
 
-    if spec.lower() == "human":
-        return "human", {"name": "Human"}
-
-    # human:NAME syntax — "human:mo" → named human player
-    m = re.match(r"^human:(.+)$", spec, re.IGNORECASE)
-    if m:
-        return "human", {"name": m.group(1).strip()}
-
-    if spec.lower() == "random":
-        return "random", {"name": "Random"}
-
-    # stockfish and stockfish:N
+    # Check stockfish first (before model config resolution)
     if spec.lower() == "stockfish":
-        return "stockfish", {"name": "Stockfish"}
-
-    # stockfish:N syntax — "stockfish:2" → skill level 2
+        return "stockfish", {"name": "Stockfish", "skill": 20}
     m = re.match(r"^stockfish:(\d+)$", spec, re.IGNORECASE)
     if m:
-        return "stockfish", {"name": f"Stockfish {m.group(1)}", "skill": int(m.group(1))}
+        skill = int(m.group(1))
+        return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
 
-    # Otherwise, treat as an LLM model string
-    return "llm", {"model": spec, "name": spec}
+    # Resolve @preset-name or inline query flags via model_config
+    try:
+        resolved_model, inline_overrides = resolve_model_spec(spec)
+    except ValueError:
+        resolved_model, inline_overrides = spec, {}
+
+    if resolved_model.lower() == "human":
+        return "human", {"name": "Human"}
+    m = re.match(r"^human:(.+)$", resolved_model, re.IGNORECASE)
+    if m:
+        return "human", {"name": m.group(1).strip()}
+    if resolved_model.lower() == "random":
+        return "random", {"name": "Random"}
+
+    # Stockfish (resolved from preset, e.g. @stockfish-0 → stockfish:0)
+    if resolved_model.lower() == "stockfish":
+        return "stockfish", {"name": "Stockfish 20", "skill": 20}
+    m = re.match(r"^stockfish:(\d+)$", resolved_model, re.IGNORECASE)
+    if m:
+        skill = int(m.group(1))
+        return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
+
+    # LLM player — merge model_config defaults with inline overrides
+    cfg = ModelConfig.load()
+    merged_kwargs = {**cfg.get_defaults(), **inline_overrides}
+    if merged_kwargs.get("tiny"):
+        merged_kwargs["use_tools"] = False
+
+    return "llm", {
+        "model": resolved_model,
+        "name": spec,  # preserve original spec as display name
+        **{k: v for k, v in merged_kwargs.items()
+           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning")},
+    }
 
 
 def main():
@@ -1223,6 +1258,16 @@ def main():
     parser.add_argument(
         "--temperature", "-t", type=float, default=0.3,
         help="LLM temperature (default: 0.3)",
+    )
+    parser.add_argument(
+        "--white-flags", type=str, default=None,
+        help="Per-model flags for white: key=val,key=val "
+             "(e.g. tools=off,tiny=true,retries=10). Overrides global flags for white only.",
+    )
+    parser.add_argument(
+        "--black-flags", type=str, default=None,
+        help="Per-model flags for black: key=val,key=val "
+             "(e.g. tools=on,retries=3). Overrides global flags for black only.",
     )
     parser.add_argument(
         "--retries", "-r", type=int, default=3,
@@ -1317,8 +1362,11 @@ def main():
         args.white = args.black = args.model
 
     # Build players
-    def build_player(spec: str, color: str):
+    def build_player(spec: str, color: str, per_player_flags: str | None = None):
         ptype, kwargs = parse_player(spec)
+        # Parse per-player CLI flags: "tools=off,tiny=true,retries=10"
+        from model_config import _parse_query_flags
+        cli_overrides = _parse_query_flags(per_player_flags) if per_player_flags else {}
         if ptype == "human":
             name = kwargs.get("name", "Human")
             return HumanPlayer(name=f"{name} ({color})")
@@ -1335,27 +1383,42 @@ def main():
             )
         else:
             name = f"{kwargs['model']} ({color})"
-            # Auto-bump timeout for verbose reasoning models (DeepSeek
-            # variants through Big Pickle Proxy). These models can take
-            # 60-120s to produce their first token when reasoning deeply.
+            # Merge: global CLI args → model_config defaults → preset → inline query → per-player flags
+            # Lower priority first, higher priority overwrites
             effective_timeout = args.timeout
+            # Auto-bump timeout for verbose reasoning models
             if kwargs["model"].startswith("bigpickle/") and effective_timeout == 120:
                 effective_timeout = 240
-            return LLMPlayer(
-                model=kwargs["model"],
-                name=name,
-                api_base=args.api_base,
-                api_key=args.api_key,
-                max_retries=args.retries,
+
+            # Start with CLI global flags
+            merged: dict[str, Any] = dict(
                 use_tools=not args.no_tools and not args.tiny,
+                max_retries=args.retries,
                 temperature=args.temperature,
                 timeout=effective_timeout,
                 tiny=args.tiny,
                 reasoning=args.reasoning,
             )
+            # Overlay kwargs from parse_player (model_config defaults + preset + inline query)
+            for key in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning"):
+                if key in kwargs:
+                    merged[key] = kwargs[key]
+            # Per-player CLI flags win over everything
+            merged.update(cli_overrides)
+            # tiny forces no-tools
+            if merged.get("tiny"):
+                merged["use_tools"] = False
 
-    white = build_player(args.white, "White")
-    black = build_player(args.black, "Black")
+            return LLMPlayer(
+                model=kwargs["model"],
+                name=name,
+                api_base=args.api_base,
+                api_key=args.api_key,
+                **merged,
+            )
+
+    white = build_player(args.white, "White", args.white_flags)
+    black = build_player(args.black, "Black", args.black_flags)
 
     # Pre-flight connectivity checks for LLM players
     for p in (white, black):

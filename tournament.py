@@ -34,35 +34,50 @@ from elo import EloTracker
 
 
 def parse_player_spec(spec: str):
-    """Parse a player spec string. Returns (player_type, label, kwargs)."""
-    from chess_llm import (
-        HumanPlayer, RandomPlayer, StockfishPlayer, LLMPlayer,
-    )
+    """Parse a player spec string. Returns (player_type, player, label).
 
-    spec = spec.strip()
+    Handles @preset-name references and inline query flags from model_config.
+    Also resolves stockfish:skill and human:name syntax.
+    """
+    from model_config import resolve_model_spec, ModelConfig
+    from chess_llm import HumanPlayer, RandomPlayer, StockfishPlayer, LLMPlayer
 
-    if spec.lower() == "human":
-        return HumanPlayer(name="Human"), "human-Human"
-    if spec.startswith("human:"):
-        name = spec.split(":", 1)[1].strip()
-        return HumanPlayer(name=name), f"human-{name}"
-    if spec.lower() == "random":
-        return RandomPlayer(name="Random"), "random"
-    if spec.lower() == "stockfish":
-        return StockfishPlayer(name="Stockfish 20", skill_level=20), "stockfish-20"
-    if spec.startswith("stockfish:"):
-        skill_str = spec.split(":", 1)[1].strip()
+    # Resolve @preset and ?query=val before dispatching
+    try:
+        resolved_model, inline_overrides = resolve_model_spec(spec)
+    except ValueError:
+        resolved_model, inline_overrides = spec, {}
+
+    if resolved_model.lower() == "human":
+        return "human", HumanPlayer(name="Human"), f"human-Human", {}
+    if resolved_model.startswith("human:"):
+        name = resolved_model.split(":", 1)[1].strip()
+        return "human", HumanPlayer(name=name), f"human-{name}", {}
+    if resolved_model.lower() == "random":
+        return "random", RandomPlayer(name="Random"), "random", {}
+    if resolved_model.lower() == "stockfish":
+        return "stockfish", StockfishPlayer(name="Stockfish 20", skill_level=20), "stockfish-20", {}
+    if resolved_model.startswith("stockfish:"):
+        skill_str = resolved_model.split(":", 1)[1].strip()
         skill = int(skill_str) if skill_str else 20
-        return StockfishPlayer(name=f"Stockfish {skill}", skill_level=skill), f"stockfish-{skill}"
+        name = f"Stockfish {skill}"
+        return "stockfish", StockfishPlayer(name=name, skill_level=skill), f"stockfish-{skill}", {}
 
-    # LLM player (text mode is more reliable for tournaments).
-    # Timeout auto-bump for reasoning models is handled in run_match().
+    # LLM player — apply inline overrides from ?query string
+    cfg = ModelConfig.load()
+    # Merge: model_config defaults → inline overrides
+    merged_kwargs = {**cfg.get_defaults(), **inline_overrides}
+    # use_tools and tiny interact: tiny forces no-tools
+    if merged_kwargs.get("tiny"):
+        merged_kwargs["use_tools"] = False
+
     player = LLMPlayer(
-        model=spec,
-        name=spec,
-        use_tools=False,
+        model=resolved_model,
+        name=spec,  # preserve original spec as display name
+        **{k: v for k, v in merged_kwargs.items()
+           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning")},
     )
-    return player, spec
+    return "llm", player, spec, merged_kwargs
 
 
 def _elo_id_from_spec(spec: str) -> str:
@@ -94,17 +109,21 @@ def run_match(white_spec: str, black_spec: str,
     """Run a single match. Returns result string ('1-0', '0-1', '1/2-1/2')."""
     from chess_llm import ChessMatch
 
-    white, w_id = parse_player_spec(white_spec)
-    black, b_id = parse_player_spec(black_spec)
+    _, white, w_id, white_overrides = parse_player_spec(white_spec)
+    _, black, b_id, black_overrides = parse_player_spec(black_spec)
 
-    # Apply kwargs to players (LLM and Stockfish).
-    # Auto-bump timeout for reasoning models through Big Pickle Proxy
-    # (these can take 60-120s for first-token on complex positions).
-    for p in (white, black):
+    # Merge: model_config defaults → preset → inline query → CLI kwargs
+    # Per-model overrides from config/query take priority over global CLI flags
+    for p, overrides in ((white, white_overrides), (black, black_overrides)):
         for k, v in player_kwargs.items():
-            if hasattr(p, k):
-                if k == "timeout" and hasattr(p, "model") and p.model.startswith("bigpickle/") and v == 120:
+            # Only set if we have a setter (skip if the override already covers it)
+            if hasattr(p, k) and k not in overrides:
+                if k == "timeout" and hasattr(p, "model") and getattr(p, "model", "").startswith("bigpickle/") and v == 120:
                     v = 240
+                setattr(p, k, v)
+        # Now apply per-model overrides (these win over global flags)
+        for k, v in overrides.items():
+            if hasattr(p, k):
                 setattr(p, k, v)
 
     # Pre-flight
@@ -419,6 +438,10 @@ def main():
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--model-flags", type=str, default=None,
+                        help="Comma-separated key=val flags applied to ALL LLM players "
+                             "(e.g. tools=off,tiny=true,retries=10). "
+                             "Per-model config from models.yaml takes priority.")
     parser.add_argument("--stockfish-skill", type=int, default=20)
     parser.add_argument("--stockfish-time", type=float, default=0.1)
     parser.add_argument(
@@ -511,6 +534,10 @@ def main():
                     tiny=args.tiny,
                     reasoning=args.reasoning,
                 )
+                # Merge --model-flags (applied to all models, but per-model config wins)
+                if args.model_flags:
+                    from model_config import _parse_query_flags
+                    player_kwargs.update(_parse_query_flags(args.model_flags))
                 elo_db = args.elo_db if args.elo else None
 
             app = TournamentApp(
@@ -544,6 +571,10 @@ def main():
         tiny=args.tiny,
         reasoning=args.reasoning,
     )
+    # Merge --model-flags (applied to all models, but per-model config wins)
+    if args.model_flags:
+        from model_config import _parse_query_flags
+        player_kwargs.update(_parse_query_flags(args.model_flags))
 
     if args.round_robin:
         round_robin(

@@ -1,0 +1,94 @@
+# chess-llm model presets (May 2026)
+#
+# Reference with @preset-name in chess_llm.py or tournament.py:
+#   python chess_llm.py -w @qwen3-local -b stockfish
+#   python tournament.py --round-robin @qwen3-local @deepseek-v4-free
+#
+# Inline overrides also work (last wins):
+#   python chess_llm.py -w @qwen3-local?retries=5
+#
+# Flag reference:
+#   tools / use_tools    — enable function-calling tool (default: on)
+#   tiny                 — compact UCI-only prompt for models <20B
+#   retries / max_retries — max illegal-move retries before forfeit
+#   temp / temperature   — generation temperature (0.0-2.0)
+#   timeout              — API timeout in seconds
+#   reasoning            — low / medium / high / none (provider support varies)
+
+# ── Global defaults (merged under every preset) ────────────────────
+defaults:
+  temperature: 0.3
+  timeout: 120
+  max_retries: 3
+
+# ── Named presets ──────────────────────────────────────────────────
+presets:
+
+  # ── Local models (llama.cpp) ──────────────────────────────────
+
+  qwen3-local:
+    model: llama-cpp/Qwen3-30B-A3B-Instruct-2507-IQ3_S-3.02bpw
+    use_tools: false
+    tiny: true
+    max_retries: 10
+    timeout: 180
+
+  qwen3-iq4:
+    model: llama-cpp/Qwen3-30B-A3B-Instruct-2507-IQ4_XS-3.63bpw
+    use_tools: true          # IQ4 might handle tools better
+    tiny: false
+    max_retries: 5
+    timeout: 180
+
+  glmf47-local:
+    model: llama-cpp/GLM-4.7-Flash-REAP-23B-A3B-UD-IQ3_XXS
+    use_tools: false
+    tiny: true
+    max_retries: 10
+    timeout: 240
+
+  # ── Free cloud models (Big Pickle Proxy) ──────────────────────
+
+  big-pickle:
+    model: bigpickle/big-pickle
+    use_tools: true
+    tiny: false
+    max_retries: 5
+    reasoning: low
+    timeout: 240
+
+  deepseek-v4-free:
+    model: bigpickle/deepseek-v4-flash-free
+    use_tools: true
+    max_retries: 3
+    reasoning: low
+    timeout: 240
+
+  nemotron-free:
+    model: bigpickle/nemotron-3-super-free
+    use_tools: true
+    max_retries: 3
+    timeout: 120
+
+  mimo-free:
+    model: bigpickle/mimo-v2.5-free
+    use_tools: true
+    max_retries: 3
+    timeout: 120
+
+  # ── Local models (Ollama) ─────────────────────────────────────
+
+  qwen3-ollama:
+    model: ollama/qwen3:30b-a3b
+    use_tools: false
+    tiny: true
+    max_retries: 5
+
+  # ── Stockfish presets ─────────────────────────────────────────
+
+  stockfish-0:
+    model: stockfish:0
+  stockfish-10:
+    model: stockfish:10
+  stockfish-20:
+    model: stockfish:20
