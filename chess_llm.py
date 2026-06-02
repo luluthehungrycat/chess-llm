@@ -463,6 +463,52 @@ def _explain_illegal(board: chess.Board, move_str: str) -> str:
         return f"The {piece.symbol()} on {from_sq} cannot move to {to_sq}."
 
 
+def _closest_legal_move(board: chess.Board, proposed_uci: str) -> chess.Move:
+    """Find the closest legal move to what the model proposed.
+
+    Used in --constrain mode: instead of retrying or forfeiting on an illegal
+    move, we find the nearest legal alternative and play that.
+
+    Strategy (in order):
+    1. If the proposed from-square has one of our pieces, pick the legal move
+       from that piece whose destination is closest (Manhattan distance).
+    2. Fall back: random legal move.
+    """
+    import random
+    import re
+
+    legal_moves = list(board.legal_moves)
+
+    # Parse UCI manually — board.parse_uci() rejects moves that aren't even
+    # pseudo-legal, but we need the from/to squares even for illegal moves.
+    m = re.match(r'^([a-h][1-8])([a-h][1-8])([nbrq]?)$', proposed_uci.lower().strip())
+    if not m:
+        return random.choice(legal_moves)
+
+    try:
+        from_sq = chess.parse_square(m.group(1))
+        to_sq = chess.parse_square(m.group(2))
+    except ValueError:
+        return random.choice(legal_moves)
+
+    # If the from-square actually has one of our pieces, find the closest
+    # legal destination among moves from that piece.
+    piece = board.piece_at(from_sq)
+    if piece is not None and piece.color == board.turn:
+        piece_moves = [m for m in legal_moves if m.from_square == from_sq]
+        if piece_moves:
+            def _sq_dist(m: chess.Move) -> int:
+                return (
+                    abs(chess.square_file(to_sq) - chess.square_file(m.to_square))
+                    + abs(chess.square_rank(to_sq) - chess.square_rank(m.to_square))
+                )
+
+            return min(piece_moves, key=_sq_dist)
+
+    # Last resort
+    return random.choice(legal_moves)
+
+
 # ── Player classes ───────────────────────────────────────────────────────────
 
 class LLMPlayer:
@@ -480,6 +526,7 @@ class LLMPlayer:
         timeout: int = 120,
         tiny: bool = False,
         reasoning: str | None = None,
+        constrain: bool = False,
     ):
         self.model = model
         self.name = name or model
@@ -491,6 +538,7 @@ class LLMPlayer:
         self.timeout = timeout
         self.tiny = tiny
         self.reasoning = reasoning  # None, "low", "medium", "high"
+        self.constrain = constrain  # force legal moves via closest-match
         self.illegal_count = 0  # stats
         self._timeout_count = 0  # track timeouts for auto-tool-fallback
 
@@ -821,6 +869,13 @@ class LLMPlayer:
                 return move
             else:
                 self.illegal_count += 1
+                if self.constrain:
+                    closest = _closest_legal_move(board, proposed_uci)
+                    print(
+                        f"  🔧 {self.name}: '{proposed_uci}' is illegal "
+                        f"→ constrained to {closest.uci()} ({board.san(closest)})"
+                    )
+                    return closest
                 if self.tiny:
                     # Tiny models often output moves from rote memory
                     # (e.g. e2e4) instead of checking the legal list.
@@ -1250,6 +1305,12 @@ def main():
              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.",
     )
     parser.add_argument(
+        "--constrain", action="store_true",
+        help="Force legal moves: when the model proposes an illegal move, "
+             "pick the closest legal move instead of retrying or forfeiting. "
+             "Use this for tiny/quantized models that can't learn from retry feedback.",
+    )
+    parser.add_argument(
         "--reasoning", choices=["low", "medium", "high", "none"], default=None,
         help="Reasoning effort for providers that support it "
              "(OpenRouter/OpenAI: reasoning_effort; Anthropic: thinking budget). "
@@ -1398,9 +1459,10 @@ def main():
                 timeout=effective_timeout,
                 tiny=args.tiny,
                 reasoning=args.reasoning,
+                constrain=args.constrain,
             )
             # Overlay kwargs from parse_player (model_config defaults + preset + inline query)
-            for key in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning"):
+            for key in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain"):
                 if key in kwargs:
                     merged[key] = kwargs[key]
             # Per-player CLI flags win over everything

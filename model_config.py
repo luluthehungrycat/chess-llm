@@ -36,6 +36,7 @@ FLAG_MAP = {
     "use_tools":     "use_tools",
     "tools":         "use_tools",       # alias: tools=on/off
     "tiny":          "tiny",
+    "constrain":     "constrain",       # force legal via closest-match
     "max_retries":   "max_retries",
     "retries":       "max_retries",     # alias
     "temperature":   "temperature",

@@ -75,7 +75,7 @@ def parse_player_spec(spec: str):
         model=resolved_model,
         name=spec,  # preserve original spec as display name
         **{k: v for k, v in merged_kwargs.items()
-           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning")},
+           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain")},
     )
     return "llm", player, spec, merged_kwargs
 
@@ -430,6 +430,9 @@ def main():
     parser.add_argument("--tiny", action="store_true",
                         help="Tiny-model mode: compact UCI-only prompt for models <20B. "
                              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.")
+    parser.add_argument("--constrain", action="store_true",
+                        help="Force legal moves: when the model proposes an illegal move, "
+                             "pick the closest legal move instead of retrying or forfeiting.")
     parser.add_argument("--reasoning", choices=["low", "medium", "high", "none"],
                         default=None,
                         help="Reasoning effort for providers that support it "
@@ -533,6 +536,7 @@ def main():
                     think_time=args.stockfish_time,
                     tiny=args.tiny,
                     reasoning=args.reasoning,
+                    constrain=args.constrain,
                 )
                 # Merge --model-flags (applied to all models, but per-model config wins)
                 if args.model_flags:
@@ -570,6 +574,7 @@ def main():
         think_time=args.stockfish_time,
         tiny=args.tiny,
         reasoning=args.reasoning,
+        constrain=args.constrain,
     )
     # Merge --model-flags (applied to all models, but per-model config wins)
     if args.model_flags:
