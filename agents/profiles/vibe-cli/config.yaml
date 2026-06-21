@@ -1,0 +1,100 @@
+# Vibe CLI Chess Agent Configuration
+# This file configures the Vibe CLI Agent for chess playing
+
+# Model Configuration
+model: "mistral-medium-3.5"  # Default model for Vibe CLI
+fallback_models: ["gpt-4o-mini", "claude-3-haiku"]  # Fallback models
+
+# Generation Parameters
+temperature: 0.2  # Lower for more consistent play
+top_p: 0.9
+top_k: 50
+max_tokens: 512  # Sufficient for chess move generation
+
+# Reasoning Configuration
+reasoning_effort: "medium"  # Vibe CLI supports reasoning
+thinking_budget: 2048  # Tokens for thinking
+
+# Performance Settings
+timeout: 60  # Seconds to wait for model response
+max_retries: 3  # Maximum retries for illegal moves or errors
+use_tools: true  # Use tool calling when available
+
+# Chess-Specific Settings
+chess:
+  legal_move_only: true  # Only make legal moves
+  uci_format: true  # Always use UCI notation
+  move_validation: true  # Validate moves before submission
+  constrain_illegal: true  # Find closest legal move if illegal proposed
+  
+  # Opening Book
+  opening_book: null  # Path to opening book file
+  use_opening_book: false  # Use opening book for first few moves
+  
+  # Analysis Settings
+  analyze_games: true  # Analyze completed games
+  save_pgn: true  # Save games in PGN format
+  
+  # Learning Settings
+  learn_from_games: true  # Learn from game outcomes
+  memory_enabled: true  # Store game memories
+  skill_extraction: true  # Extract skills from games
+
+# Vibe CLI-Specific Settings
+vibe_cli:
+  # Agent Identity
+  agent_id: "vibe-chess"  # Unique identifier for this agent
+  agent_name: "Vibe CLI Chess Agent"  # Display name
+  
+  # Server Configuration
+  mcp_enabled: true  # Use MCP protocol
+  mcp_port: 8080  # MCP server port
+  acp_enabled: true  # Use ACP protocol (Vibe CLI native)
+  acp_port: 8081  # ACP server port
+  
+  # CLI Configuration
+  cli_enabled: true  # Use CLI commands
+  cli_command: "vibe"  # CLI command name
+  
+  # Vibe CLI Features
+  auto_complete: true  # Use Vibe CLI's auto-complete features
+  context_window: 32768  # Use large context window when available
+
+# Agent Profile
+agent:
+  name: "Vibe CLI Chess Agent"
+  id: "vibe-cli"
+  version: "1.0"
+  description: "Chess-playing agent using Vibe CLI framework"
+  
+  # Personality
+  playing_style: "balanced"  # aggressive, balanced, strategic, positional, defensive
+  risk_tolerance: 0.7  # 0.0-1.0, higher = more risk
+  creativity: 0.7  # 0.0-1.0, higher = more creative
+  
+  # Learning
+  continuous_learning: true  # Learn between games and sessions
+  opponent_modeling: true  # Build profiles of opponents
+  self_improvement: true  # Continuously improve capabilities
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_file: "./logs/vibe-cli.log"  # Log file path
+  max_file_size: 10485760  # 10MB
+  backup_count: 5  # Number of backup log files
+
+# Network Configuration
+network:
+  timeout: 30  # Network timeout in seconds
+  retries: 3  # Network retry count
+
+# Example Usage:
+# python chess_llm.py -w vibe-cli:mistral-medium-3.5 -b opencode-agent:deepseek-v4-flash-free
+# python chess_llm.py -w vibe-cli:gpt-4o-mini -b stockfish
+
+# Notes:
+# - This configuration is for the Vibe CLI harness
+# - Model must be available through Vibe CLI
+# - For CLI mode, ensure 'vibe' command is in PATH
+# - For server mode, start Vibe CLI first: vibe serve

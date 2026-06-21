@@ -1,0 +1,25 @@
+{
+  "memory_id": "a7a476d7-31ce-480f-8699-dd619088e2a2",
+  "agent_id": "test-agent",
+  "game_id": "game-123",
+  "timestamp": "2026-06-21T17:45:03.732812",
+  "board_state": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+  "move_number": 1,
+  "color": "white",
+  "move": "e2e4",
+  "move_san": "e4",
+  "reasoning": "Controls the center",
+  "confidence": 0.8,
+  "outcome": "win",
+  "evaluation": null,
+  "lessons": [
+    "Opening principle: control the center"
+  ],
+  "tags": [
+    "opening",
+    "center"
+  ],
+  "opponent": "",
+  "opening": "",
+  "phase": ""
+}

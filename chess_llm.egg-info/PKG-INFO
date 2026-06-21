@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: chess-llm
+Version: 0.1.0
+Summary: Pit LLMs, humans, and Stockfish against each other in chess
+Requires-Python: >=3.11
+Requires-Dist: chess>=1.11
+Requires-Dist: litellm>=1.80
+Requires-Dist: openai>=2.0
+Requires-Dist: botocore>=1.30
+Requires-Dist: textual>=0.60
+Provides-Extra: stockfish
+Requires-Dist: stockfish>=5.0; extra == "stockfish"

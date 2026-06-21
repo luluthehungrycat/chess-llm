@@ -1,0 +1,151 @@
+# Hermes Chess Agent Configuration
+# This file configures the Hermes Agent for chess playing
+
+# Model Configuration
+model: "qwen3.5-27B"  # Default model for Hermes
+fallback_models: ["llama-3.3-70b", "deepseek-v4-flash-free"]  # Fallback models
+
+# Generation Parameters
+temperature: 0.2  # Lower for more consistent, strategic play
+top_p: 0.9
+top_k: 50
+max_tokens: 1024  # Sufficient for chess analysis and move generation
+
+# Reasoning Configuration
+reasoning_effort: "high"  # Hermes supports deep reasoning
+thinking_budget: 4096  # Tokens for thinking
+
+# Performance Settings
+timeout: 120  # Seconds to wait for model response (Hermes can use more time)
+max_retries: 3  # Maximum retries for illegal moves or errors
+use_tools: true  # Use tool calling when available
+
+# Chess-Specific Settings
+chess:
+  legal_move_only: true  # Only make legal moves
+  uci_format: true  # Always use UCI notation
+  move_validation: true  # Validate moves before submission
+  constrain_illegal: true  # Find closest legal move if illegal proposed
+  
+  # Opening Book
+  opening_book: null  # Path to opening book file
+  use_opening_book: false  # Use opening book for first few moves
+  
+  # Analysis Settings
+  analyze_games: true  # Analyze completed games
+  save_pgn: true  # Save games in PGN format
+  
+  # Learning Settings - Hermes excels at learning
+  learn_from_games: true  # Learn from game outcomes
+  memory_enabled: true  # Store game memories (Hermes native)
+  skill_extraction: true  # Extract skills from games
+  routine_creation: true  # Create routines from patterns
+
+# Hermes-Specific Settings
+hermes:
+  # Agent Identity
+  agent_id: "hermes-chess"  # Unique identifier for this agent
+  agent_name: "Hermes Chess Agent"  # Display name
+  
+  # Memory Configuration
+  memory_dir: "./data/memory/hermes"  # Directory for memory storage
+  memory_backend: "sqlite"  # sqlite, postgres, or chroma
+  
+  # Skill Configuration
+  skills_dir: "./data/skills/hermes"  # Directory for skill storage
+  auto_apply_skills: true  # Automatically apply relevant skills
+  
+  # Routine Configuration
+  routines_dir: "./data/routines/hermes"  # Directory for routine storage
+  auto_create_routines: true  # Automatically create routines from patterns
+  
+  # Server Configuration
+  mcp_enabled: true  # Use MCP protocol (Hermes native)
+  mcp_port: 8080  # MCP server port
+  webhook_enabled: true  # Use webhook protocol
+  webhook_port: 8082  # Webhook server port
+  
+  # CLI Configuration
+  cli_enabled: true  # Use CLI commands
+  cli_command: "hermes"  # CLI command name
+
+# Agent Profile
+agent:
+  name: "Hermes Chess Agent"
+  id: "hermes-agent"
+  version: "1.0"
+  description: "Chess-playing agent using Hermes Agent framework"
+  
+  # Personality
+  playing_style: "strategic"  # aggressive, balanced, strategic, positional, defensive
+  risk_tolerance: 0.6  # 0.0-1.0, higher = more risk
+  creativity: 0.8  # 0.0-1.0, higher = more creative
+  
+  # Learning
+  continuous_learning: true  # Learn between games and sessions
+  opponent_modeling: true  # Build profiles of opponents
+  self_improvement: true  # Continuously improve capabilities
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_file: "./logs/hermes-agent.log"  # Log file path
+  max_file_size: 10485760  # 10MB
+  backup_count: 5  # Number of backup log files
+  
+  # Game Logging
+  log_games: true  # Log game moves and decisions
+  log_analysis: true  # Log game analysis
+  log_learning: true  # Log learning and skill development
+  log_errors: true  # Log errors and warnings
+
+# Network Configuration
+network:
+  timeout: 60  # Network timeout in seconds
+  retries: 3  # Network retry count
+  proxy: null  # HTTP proxy URL (optional)
+  
+  # Rate Limiting
+  max_requests_per_minute: 30  # Rate limit for API calls (Hermes may need more time)
+  request_spacing: 2.0  # Minimum seconds between requests
+
+# Performance Monitoring
+monitoring:
+  enabled: true  # Enable performance monitoring
+  metrics_file: "./data/metrics/hermes.json"  # Metrics storage
+  
+  # Track these metrics
+  track:
+    - move_generation_time
+    - token_usage
+    - win_rate
+    - elo_rating
+    - error_rate
+    - retry_rate
+    - skill_usage
+    - memory_access
+
+# Security Settings
+security:
+  api_key_masking: true  # Mask API keys in logs
+  input_validation: true  # Validate all inputs
+  output_sanitization: true  # Sanitize outputs
+  memory_isolation: true  # Isolate memory between different contexts
+
+# Environment Overrides
+environment_overrides:
+  model: "HERMES_CHESS_MODEL"
+  temperature: "HERMES_CHESS_TEMPERATURE"
+  timeout: "HERMES_CHESS_TIMEOUT"
+  mcp_port: "HERMES_MCP_PORT"
+
+# Example Usage:
+# python chess_llm.py -w hermes-agent:qwen3.5-27B -b opencode-agent:deepseek-v4-flash-free
+# python chess_llm.py -w hermes-agent:llama-3.3-70b -b stockfish
+
+# Notes:
+# - This configuration is for the Hermes Agent harness
+# - Model must be available through Hermes
+# - For CLI mode, ensure 'hermes' command is in PATH
+# - For server mode, start Hermes first: hermes start
+# - Hermes excels at learning and memory, so enable those features
