@@ -1,0 +1,63 @@
+# Words to ignore for codespell
+# Add words that are correct in your project but flagged as misspellings
+
+# Technical terms
+UCI
+FEN
+SAN
+MCP
+ACP
+LLM
+API
+CLI
+JSON
+YAML
+HTTP
+HTTPS
+URL
+URI
+GPU
+CPU
+RAM
+ELO
+PGN
+
+# Chess terms
+chess
+board
+move
+piece
+square
+king
+queen
+rook
+bishop
+knight
+pawn
+castling
+enpassant
+checkmate
+stalemate
+
+# Project-specific
+hermes
+opencode
+vibe
+chess-llm
+agent-harness
+harnesses
+
+# Common abbreviations
+etc
+vs
+config
+params
+args
+kwargs
+
+# File extensions
+md
+yml
+yaml
+py
+json
