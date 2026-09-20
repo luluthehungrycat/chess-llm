@@ -1,0 +1,54 @@
+name: Python CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install python-chess httpx
+
+    - name: Run agent harness tests
+      run: |
+        python test_agent_harness.py
+
+    - name: Run basic chess_llm tests
+      run: |
+        python -c "
+        import chess_llm
+        from chess_llm import parse_player, ChessMatch
+        import chess
+        
+        # Test basic functionality
+        print('Testing basic chess_llm functionality...')
+        
+        # Test player parsing
+        player_type, config = parse_player('stockfish')
+        assert player_type == 'stockfish', f'Expected stockfish, got {player_type}'
+        
+        player_type, config = parse_player('human')
+        assert player_type == 'human', f'Expected human, got {player_type}'
+        
+        player_type, config = parse_player('random')
+        assert player_type == 'random', f'Expected random, got {player_type}'
+        
+        # Test agent harness parsing
+        player_type, config = parse_player('hermes:qwen3.5-27B')
+        assert player_type == 'agent_harness', f'Expected agent_harness, got {player_type}'
+        
+        print('✅ All basic tests passed')
+        "

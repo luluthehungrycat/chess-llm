@@ -1,0 +1,133 @@
+# OpenCode Chess Agent Configuration
+# This file configures the OpenCode Agent for chess playing
+
+# Model Configuration
+model: "deepseek-v4-flash-free"  # Default model for OpenCode
+fallback_models: ["qwen3-70b", "llama-3.3-70b"]  # Fallback models if primary fails
+
+# Generation Parameters
+temperature: 0.2  # Lower for more consistent play
+top_p: 0.9
+top_k: 50
+max_tokens: 512  # Sufficient for chess move generation
+
+# Reasoning Configuration
+reasoning_effort: "medium"  # low, medium, high, or none
+thinking_budget: 2048  # Tokens for thinking (if supported)
+
+# Performance Settings
+timeout: 60  # Seconds to wait for model response
+max_retries: 3  # Maximum retries for illegal moves or errors
+use_tools: true  # Use tool calling when available
+
+# Chess-Specific Settings
+chess:
+  legal_move_only: true  # Only make legal moves
+  uci_format: true  # Always use UCI notation
+  move_validation: true  # Validate moves before submission
+  constrain_illegal: true  # Find closest legal move if illegal proposed
+  
+  # Opening Book (optional)
+  opening_book: null  # Path to opening book file
+  use_opening_book: false  # Use opening book for first few moves
+  
+  # Analysis Settings
+  analyze_games: true  # Analyze completed games
+  save_pgn: true  # Save games in PGN format
+  
+  # Learning Settings
+  learn_from_games: true  # Learn from game outcomes
+  memory_enabled: true  # Store game memories
+  skill_extraction: true  # Extract skills from games
+
+# OpenCode-Specific Settings
+opencode:
+  base_url: "https://api.opencode.ai"  # OpenCode API endpoint
+  api_key_env: "OPENCODE_API_KEY"  # Environment variable for API key
+  
+  # Server Configuration (if using opencode serve)
+  serve_enabled: false  # Run local OpenCode server
+  serve_port: 4096  # Port for OpenCode server
+  serve_host: "localhost"  # Host for OpenCode server
+  
+  # MCP Configuration
+  mcp_enabled: false  # Use MCP protocol
+  mcp_port: 8081  # MCP server port
+  
+  # CLI Configuration
+  cli_enabled: true  # Use CLI commands
+  cli_command: "opencode"  # CLI command name
+
+# Agent Profile
+agent:
+  name: "OpenCode Chess Agent"
+  id: "opencode-agent"
+  version: "1.0"
+  description: "Chess-playing agent using OpenCode framework"
+  
+  # Personality
+  playing_style: "balanced"  # aggressive, balanced, positional, defensive
+  risk_tolerance: 0.7  # 0.0-1.0, higher = more risk
+  
+  # Learning
+  memory_dir: "./data/memory/opencode"  # Directory for memory storage
+  skills_dir: "./data/skills/opencode"  # Directory for skill storage
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_file: "./logs/opencode-agent.log"  # Log file path
+  max_file_size: 10485760  # 10MB
+  backup_count: 5  # Number of backup log files
+  
+  # Game Logging
+  log_games: true  # Log game moves and decisions
+  log_analysis: true  # Log game analysis
+  log_errors: true  # Log errors and warnings
+
+# Network Configuration
+network:
+  timeout: 30  # Network timeout in seconds
+  retries: 3  # Network retry count
+  proxy: null  # HTTP proxy URL (optional)
+  
+  # Rate Limiting
+  max_requests_per_minute: 60  # Rate limit for API calls
+  request_spacing: 1.0  # Minimum seconds between requests
+
+# Performance Monitoring
+monitoring:
+  enabled: true  # Enable performance monitoring
+  metrics_file: "./data/metrics/opencode.json"  # Metrics storage
+  
+  # Track these metrics
+  track:
+    - move_generation_time
+    - token_usage
+    - win_rate
+    - error_rate
+    - retry_rate
+
+# Security Settings
+security:
+  api_key_masking: true  # Mask API keys in logs
+  input_validation: true  # Validate all inputs
+  output_sanitization: true  # Sanitize outputs
+
+# Environment Overrides
+# These settings can be overridden by environment variables
+environment_overrides:
+  model: "OPENCODE_CHESS_MODEL"
+  temperature: "OPENCODE_CHESS_TEMPERATURE"
+  timeout: "OPENCODE_CHESS_TIMEOUT"
+  base_url: "OPENCODE_CHESS_BASE_URL"
+
+# Example Usage:
+# python chess_llm.py -w opencode-agent:deepseek-v4-flash-free -b stockfish
+# python chess_llm.py -w opencode-agent:qwen3-70b -b hermes-agent:llama-3.2-11b-vision
+
+# Notes:
+# - This configuration is for the OpenCode Agent harness
+# - Model must be available through OpenCode
+# - For CLI mode, ensure 'opencode' command is in PATH
+# - For server mode, start OpenCode server first: opencode serve

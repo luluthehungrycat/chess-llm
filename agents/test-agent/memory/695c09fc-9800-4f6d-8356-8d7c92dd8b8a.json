@@ -1,0 +1,20 @@
+{
+  "memory_id": "695c09fc-9800-4f6d-8356-8d7c92dd8b8a",
+  "agent_id": "test-agent",
+  "game_id": "game-123",
+  "timestamp": "2026-06-21T17:45:03.733339",
+  "board_state": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+  "move_number": 2,
+  "color": "black",
+  "move": "e7e5",
+  "move_san": "e7e5",
+  "reasoning": "Responds to e4",
+  "confidence": 0.7,
+  "outcome": "unknown",
+  "evaluation": null,
+  "lessons": [],
+  "tags": [],
+  "opponent": "",
+  "opening": "",
+  "phase": ""
+}

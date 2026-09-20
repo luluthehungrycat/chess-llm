@@ -7,6 +7,7 @@ Players:
   human   — you, via terminal input
   random  — random legal move (baseline benchmark)
   stockfish — Stockfish engine
+  agent   — external agent harnesses (Hermes, OpenCode, Vibe CLI)
 
 Provider shortcuts (auto-detect API key from env):
   opencode-go/deepseek-v4-pro   →  https://opencode.ai/zen/go/v1  ($OPENCODE_GO_API_KEY)
@@ -18,6 +19,13 @@ Provider shortcuts (auto-detect API key from env):
   ollama/llama3                 →  local Ollama                    (no key needed)
   bigpickle/big-pickle          →  local Big Pickle Proxy :8000    (no key needed)
 
+Agent Harnesses (autonomous agents that learn and improve):
+  hermes:model              — Hermes Agent (e.g., hermes:qwen3.5-27B)
+  hermes-agent:model        — Hermes Agent (alternative syntax)
+  opencode:model            — OpenCode Agent (e.g., opencode:deepseek-v4-flash-free)
+  opencode-agent:model      — OpenCode Agent (alternative syntax)
+  vibe-cli:model            — Vibe CLI Agent (e.g., vibe-cli:mistral-medium-3.5)
+
 Usage:
   python chess_llm.py                          # LLM vs LLM (default models)
   python chess_llm.py --white human            # You play white
@@ -27,6 +35,11 @@ Usage:
   python chess_llm.py -w @qwen3-local --black-flags "tools=on"  # per-player CLI override
   python chess_llm.py --model opencode-go/deepseek-v4-pro  # both sides same model
   python chess_llm.py --white human --black stockfish      # You vs Stockfish
+  
+  # Agent harness examples:
+  python chess_llm.py -w hermes:qwen3.5-27B -b opencode-agent:deepseek-v4-flash-free --elo --log
+  python chess_llm.py --white vibe-cli:mistral-medium-3.5 --black stockfish
+  python chess_llm.py -w hermes-agent:llama-3.3-70b -b opencode:qwen3-70b
 """
 
 import argparse
@@ -248,15 +261,26 @@ def _call_llm(
     result = {"content": choice.content or ""}
     if choice.tool_calls:
         import json
-        result["tool_calls"] = [
-            {
-                "name": tc.function.name,
-                "arguments": json.loads(tc.function.arguments)
-                if isinstance(tc.function.arguments, str)
-                else tc.function.arguments,
-            }
-            for tc in choice.tool_calls
-        ]
+        result["tool_calls"] = []
+        for tc in choice.tool_calls:
+            try:
+                # Handle both string and already-parsed dict arguments
+                if isinstance(tc.function.arguments, str):
+                    args = json.loads(tc.function.arguments)
+                elif isinstance(tc.function.arguments, dict):
+                    args = tc.function.arguments
+                else:
+                    # Fallback: convert to string and try parsing
+                    args = json.loads(str(tc.function.arguments))
+                result["tool_calls"].append({
+                    "name": tc.function.name,
+                    "arguments": args,
+                })
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                if DEBUG:
+                    print(f"  ⚠ {tc.function.name}: failed to parse arguments: {e}")
+                # Skip this tool call rather than failing the entire move
+                continue
     # Expose finish_reason + token usage for debug logging.
     # finish_reason="length" is the key signal that the model hit
     # max_tokens before producing output (common with reasoning models).
@@ -472,22 +496,34 @@ def _closest_legal_move(board: chess.Board, proposed_uci: str) -> chess.Move:
     Strategy (in order):
     1. If the proposed from-square has one of our pieces, pick the legal move
        from that piece whose destination is closest (Manhattan distance).
-    2. Fall back: random legal move.
+    2. If from-square is valid but no piece, try to find moves to the proposed
+       to-square from any of our pieces.
+    3. Fall back: random legal move.
     """
     import random
     import re
 
     legal_moves = list(board.legal_moves)
+    if not legal_moves:
+        # Should never happen in a real game, but be safe
+        raise ValueError("No legal moves available")
 
     # Parse UCI manually — board.parse_uci() rejects moves that aren't even
     # pseudo-legal, but we need the from/to squares even for illegal moves.
+    # Handle both standard UCI (e2e4) and UCI with promotion (e7e8q)
     m = re.match(r'^([a-h][1-8])([a-h][1-8])([nbrq]?)$', proposed_uci.lower().strip())
     if not m:
+        # Try to extract any UCI-like pattern from the string
+        # This handles cases where the model outputs extra text
+        uci_match = re.search(r'([a-h][1-8][a-h][1-8][nbrq]?)', proposed_uci.lower())
+        if uci_match:
+            return _closest_legal_move(board, uci_match.group(1))
         return random.choice(legal_moves)
 
     try:
         from_sq = chess.parse_square(m.group(1))
         to_sq = chess.parse_square(m.group(2))
+        promotion = m.group(3) or ''
     except ValueError:
         return random.choice(legal_moves)
 
@@ -497,13 +533,28 @@ def _closest_legal_move(board: chess.Board, proposed_uci: str) -> chess.Move:
     if piece is not None and piece.color == board.turn:
         piece_moves = [m for m in legal_moves if m.from_square == from_sq]
         if piece_moves:
-            def _sq_dist(m: chess.Move) -> int:
-                return (
-                    abs(chess.square_file(to_sq) - chess.square_file(m.to_square))
-                    + abs(chess.square_rank(to_sq) - chess.square_rank(m.to_square))
-                )
+            # Filter by promotion piece if specified
+            if promotion:
+                piece_moves = [m for m in piece_moves if m.promotion and chess.piece_symbol(m.promotion).lower() == promotion.lower()]
+            if piece_moves:
+                def _sq_dist(m: chess.Move) -> int:
+                    return (
+                        abs(chess.square_file(to_sq) - chess.square_file(m.to_square))
+                        + abs(chess.square_rank(to_sq) - chess.square_rank(m.to_square))
+                    )
 
-            return min(piece_moves, key=_sq_dist)
+                return min(piece_moves, key=_sq_dist)
+
+    # Strategy 2: Try to find moves to the proposed to-square from any of our pieces
+    to_square_moves = [m for m in legal_moves if m.to_square == to_sq]
+    if to_square_moves:
+        # Find the move from the piece closest to the proposed from-square
+        def _from_sq_dist(m: chess.Move) -> int:
+            return (
+                abs(chess.square_file(from_sq) - chess.square_file(m.from_square))
+                + abs(chess.square_rank(from_sq) - chess.square_rank(m.from_square))
+            )
+        return min(to_square_moves, key=_from_sq_dist)
 
     # Last resort
     return random.choice(legal_moves)
@@ -755,11 +806,12 @@ class LLMPlayer:
             if not content and not tool_calls:
                 if attempt < self.max_retries:
                     empty_retries += 1
-                    wait = 2 ** attempt
+                    # Exponential backoff with jitter, but cap at reasonable max
+                    wait = min(2 ** empty_retries + _random.uniform(0, 1), 16)
                     hint = ""
                     if self.use_tools and attempt == 1:
                         hint = " (model may not support tools — try --no-tools)"
-                    print(f"  ⚠ {self.name}: empty API response, retrying in {wait}s...{hint}")
+                    print(f"  ⚠ {self.name}: empty API response, retrying in {wait:.1f}s...{hint}")
                     time.sleep(wait)
                     # Auto-disable tools for retry 2+ if model returned nothing
                     if attempt >= 2 and self.use_tools:
@@ -1204,10 +1256,22 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
       stockfish / stockfish:N — StockfishPlayer
       @preset-name          — Resolved from models.yaml
       provider/model        — LLMPlayer (with optional ?flags)
+      harness:model         — AgentHarnessPlayer (e.g., hermes:qwen3.5-27B, opencode-agent:deepseek-v4)
     """
     from model_config import resolve_model_spec, ModelConfig
+    from agents.agent_player_integration import is_agent_harness_spec, parse_agent_harness_spec
 
     spec = spec.strip()
+
+    # Check for agent harness specifications first (e.g., hermes:qwen3.5-27B)
+    if is_agent_harness_spec(spec):
+        harness_name, model, extra_kwargs = parse_agent_harness_spec(spec)
+        return "agent_harness", {
+            "spec": spec,
+            "harness_name": harness_name,
+            "model": model,
+            **extra_kwargs
+        }
 
     # Check stockfish first (before model config resolution)
     if spec.lower() == "stockfish":
@@ -1441,6 +1505,38 @@ def main():
                 think_time=args.stockfish_time,
                 threads=args.stockfish_threads,
                 binary_path=args.stockfish_path,
+            )
+        elif ptype == "agent_harness":
+            # Handle agent harness specifications (e.g., hermes:qwen3.5-27B)
+            from agents.agent_player_integration import create_agent_harness_player
+            
+            # Merge: global CLI args → per-player flags → harness defaults
+            merged: dict[str, Any] = dict(
+                use_tools=not args.no_tools and not args.tiny,
+                max_retries=args.retries,
+                temperature=args.temperature,
+                timeout=args.timeout,
+                tiny=args.tiny,
+                reasoning=args.reasoning,
+                constrain=args.constrain,
+            )
+            # Overlay harness-specific kwargs
+            for key in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain"):
+                if key in kwargs:
+                    merged[key] = kwargs[key]
+            # Per-player CLI flags win over everything
+            merged.update(cli_overrides)
+            # tiny forces no-tools
+            if merged.get("tiny"):
+                merged["use_tools"] = False
+            
+            # Get the original spec for the harness
+            spec = kwargs.get("spec", spec)
+            
+            return create_agent_harness_player(
+                spec=spec,
+                color=color,
+                **merged
             )
         else:
             name = f"{kwargs['model']} ({color})"

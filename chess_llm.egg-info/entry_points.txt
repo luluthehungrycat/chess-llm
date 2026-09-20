@@ -1,0 +1,2 @@
+[console_scripts]
+chess-llm = chess_llm:main
