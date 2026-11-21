@@ -130,19 +130,48 @@ def _resolve_provider(model: str) -> tuple[str, str | None, str | None]:
     return model, None, None
 
 
-# ── Silence litellm's stderr spam once at module load ────────────────────────
-# litellm writes "Provider List: https://...", "Give Feedback / Get Help", etc.
-# to stderr on every error. We redirect stderr to /dev/null globally unless
-# LLM_CHESS_DEBUG=1 (or DEBUG_CHESS_LLM=1).
+# ── Quiet litellm's log spam (without touching sys.stderr) ───────────────────
+# litellm emits "Provider List: https://...", "Give Feedback / Get Help" and
+# cost-map warnings. Those are silenced via its logger levels here and
+# `litellm.suppress_debug_info` in _call_llm. We deliberately do NOT redirect
+# sys.stderr: that is process-wide and previously hid argparse errors,
+# tracebacks, and errors from parallel tournament threads.
 if not DEBUG:
     import logging
     logging.getLogger("litellm").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
-    # Redirect stderr to /dev/null for the lifetime of the process.
-    # The --log tee in main() replaces sys.stderr again after this,
-    # so stderr still ends up in the log file (just without litellm noise).
-    _litellm_devnull = open(os.devnull, "w")
-    sys.stderr = _litellm_devnull
+
+
+def _run_with_timeout(fn, limit: float, /, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a daemon thread; raise TimeoutError after
+    `limit` seconds. (Positional-only so callers can pass a `timeout=` kwarg
+    through to fn — litellm.completion takes one.)
+
+    Unlike `with ThreadPoolExecutor()`, this returns control immediately on
+    timeout (the executor's __exit__ would block until the hung call
+    finished). The thread is a daemon so a hung call cannot keep the process
+    alive at exit. Python cannot kill a thread, so a timed-out call keeps
+    running in the background until the provider gives up; its result is
+    discarded.
+    """
+    import threading
+
+    outcome: dict = {}
+
+    def _target():
+        try:
+            outcome["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # re-raised in the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True, name="llm-call")
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        raise TimeoutError(f"call did not finish within {limit}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 # ── LLM interface ────────────────────────────────────────────────────────────
 
@@ -232,17 +261,14 @@ def _call_llm(
         _apply_reasoning(kwargs, resolved_model, reasoning)
 
     # ── Hard timeout via thread (litellm's timeout is unreliable) ──────
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(litellm.completion, **kwargs)
-        try:
-            response = future.result(timeout=timeout + 15)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(
-                f"No response from {resolved_model} after {timeout + 15}s. "
-                f"Local model may be overloaded — try fewer parallel games "
-                f"or increase --timeout."
-            )
+    try:
+        response = _run_with_timeout(litellm.completion, timeout + 15, **kwargs)
+    except TimeoutError:
+        raise TimeoutError(
+            f"No response from {resolved_model} after {timeout + 15}s. "
+            f"Local model may be overloaded — try fewer parallel games "
+            f"or increase --timeout."
+        ) from None
     choice = response.choices[0].message
 
     result = {"content": choice.content or ""}
@@ -354,10 +380,20 @@ _SAN_TOKEN_RE = re.compile(
 
 def _extract_move(text: str, board: chess.Board) -> Optional[str]:
     """Extract a move (UCI or SAN) from free-text LLM output. Returns UCI string or None."""
-    # 1a. Try the explicit MOVE: marker (UCI format)
-    m = _MOVE_RE.search(text)
-    if m:
-        return m.group(1)
+    # 1a. Try the explicit MOVE: marker (UCI format). Prefer a legal marked
+    #     move; if the marked move is illegal, keep scanning (the model may
+    #     have corrected itself later) and only fall back to the illegal
+    #     marker at the end so the caller can explain why it was rejected.
+    marked_fallback = None
+    for m in _MOVE_RE.finditer(text):
+        uci = m.group(1).lower()
+        try:
+            if board.parse_uci(uci) in board.legal_moves:
+                return uci
+        except ValueError:
+            pass
+        if marked_fallback is None:
+            marked_fallback = uci
 
     # 1b. Try "make_move d6" or "my move: Nf6" style
     m = _MOVE_CMD_RE.search(text)
@@ -403,7 +439,7 @@ def _extract_move(text: str, board: chess.Board) -> Optional[str]:
         except ValueError:
             continue
 
-    return None
+    return marked_fallback
 
 
 def _explain_illegal(board: chess.Board, move_str: str) -> str:
@@ -1107,7 +1143,18 @@ class ChessMatch:
                 p.close()
 
     def play(self) -> str:
-        """Play the game until conclusion. Returns result string ('1-0', '0-1', '1/2-1/2')."""
+        """Play the game until conclusion. Returns result string ('1-0', '0-1', '1/2-1/2').
+
+        Engine players are always closed, even if a player raises or the
+        user hits Ctrl-C — otherwise Stockfish processes leak, which
+        tournaments multiply across games.
+        """
+        try:
+            return self._play()
+        finally:
+            self._cleanup()
+
+    def _play(self) -> str:
         move_num = 0
 
         while not self.board.is_game_over(claim_draw=True):
@@ -1129,7 +1176,6 @@ class ChessMatch:
                 move = player.get_move(self.board, self._history_text())
             except IllegalMoveForfeit as e:
                 print(f"\n🏳 {e}")
-                self._cleanup()
                 if self.board.turn == chess.WHITE:
                     self.pgn_game.headers["Result"] = "0-1"
                     return "0-1"
@@ -1147,8 +1193,7 @@ class ChessMatch:
             if self.delay > 0:
                 time.sleep(self.delay)
 
-        # Game over
-        self._cleanup()
+        # Game over (engines are closed by play()'s finally)
         print(f"\n{'=' * 40}")
         print(render_board(self.board, self.board.move_stack[-1] if self.board.move_stack else None))
         result = self.board.result(claim_draw=True)
@@ -1191,6 +1236,23 @@ class ChessMatch:
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+# LLMPlayer kwargs that a player spec (models.yaml / ?query flags) may set.
+# Shared by parse_player, main()'s build_player and tournament.py so the
+# single-game and tournament paths can't drift apart again.
+LLM_PLAYER_KWARGS = (
+    "use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain",
+)
+
+
+def _parse_stockfish(spec: str) -> Optional[tuple[str, dict[str, Any]]]:
+    """'stockfish' / 'stockfish:N' / 'stockfish:' (→ skill 20), else None."""
+    m = re.match(r"^stockfish(?::(\d*))?$", spec.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    skill = int(m.group(1)) if m.group(1) else 20
+    return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
+
+
 def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
     """
     Parse a player spec string into (type, kwargs) with model config support.
@@ -1210,18 +1272,14 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
     spec = spec.strip()
 
     # Check stockfish first (before model config resolution)
-    if spec.lower() == "stockfish":
-        return "stockfish", {"name": "Stockfish", "skill": 20}
-    m = re.match(r"^stockfish:(\d+)$", spec, re.IGNORECASE)
-    if m:
-        skill = int(m.group(1))
-        return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
+    sf = _parse_stockfish(spec)
+    if sf:
+        return sf
 
-    # Resolve @preset-name or inline query flags via model_config
-    try:
-        resolved_model, inline_overrides = resolve_model_spec(spec)
-    except ValueError:
-        resolved_model, inline_overrides = spec, {}
+    # Resolve @preset-name or inline query flags via model_config.
+    # A ValueError here (unknown @preset, unknown ?flag) propagates: silently
+    # treating "@typo" as a literal LLM model name hid user mistakes.
+    resolved_model, inline_overrides = resolve_model_spec(spec)
 
     if resolved_model.lower() == "human":
         return "human", {"name": "Human"}
@@ -1232,12 +1290,9 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
         return "random", {"name": "Random"}
 
     # Stockfish (resolved from preset, e.g. @stockfish-0 → stockfish:0)
-    if resolved_model.lower() == "stockfish":
-        return "stockfish", {"name": "Stockfish 20", "skill": 20}
-    m = re.match(r"^stockfish:(\d+)$", resolved_model, re.IGNORECASE)
-    if m:
-        skill = int(m.group(1))
-        return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
+    sf = _parse_stockfish(resolved_model)
+    if sf:
+        return sf
 
     # LLM player — merge model_config defaults with inline overrides
     cfg = ModelConfig.load()
@@ -1248,8 +1303,7 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
     return "llm", {
         "model": resolved_model,
         "name": spec,  # preserve original spec as display name
-        **{k: v for k, v in merged_kwargs.items()
-           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning")},
+        **{k: v for k, v in merged_kwargs.items() if k in LLM_PLAYER_KWARGS},
     }
 
 
@@ -1462,7 +1516,7 @@ def main():
                 constrain=args.constrain,
             )
             # Overlay kwargs from parse_player (model_config defaults + preset + inline query)
-            for key in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain"):
+            for key in LLM_PLAYER_KWARGS:
                 if key in kwargs:
                     merged[key] = kwargs[key]
             # Per-player CLI flags win over everything
@@ -1479,8 +1533,11 @@ def main():
                 **merged,
             )
 
-    white = build_player(args.white, "White", args.white_flags)
-    black = build_player(args.black, "Black", args.black_flags)
+    try:
+        white = build_player(args.white, "White", args.white_flags)
+        black = build_player(args.black, "Black", args.black_flags)
+    except ValueError as e:  # unknown @preset / ?flag — fail loud, exit 2
+        parser.error(str(e))
 
     # Pre-flight connectivity checks for LLM players
     for p in (white, black):
