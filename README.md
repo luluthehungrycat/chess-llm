@@ -132,7 +132,7 @@ All games auto-save as PGN in `./games/` — load them in Lichess or Chess.com f
 | `--stockfish-skill` | `20` | Stockfish skill 0–20 (for `stockfish` without `:N`) |
 | `--stockfish-time` | `0.1` | Stockfish think time in seconds |
 | `--stockfish-threads` | all cores | Stockfish CPU threads |
-| `--stockfish-path` | auto | Stockfish binary |
+| `--stockfish-path` | auto | Stockfish binary (`chess_llm.py` only for now) |
 | `--api-base`, `--api-key` | provider default | Override endpoint and key (`LLM_CHESS_API_BASE`, `LLM_CHESS_API_KEY`) |
 
 ### `tournament.py`
@@ -154,7 +154,7 @@ All games auto-save as PGN in `./games/` — load them in Lichess or Chess.com f
 | `--retries`, `--temperature`, `--timeout`, `--no-tools`, `--tiny`, `--constrain`, `--reasoning` | as in `chess_llm.py` | Defaults applied to LLM players |
 | `--stockfish-time`, `--stockfish-threads` | `0.1`, all cores | Stockfish settings |
 
-If the TUI fails to start, `tournament.py` prints a warning to stderr and falls back to plain-text mode. Use `--no-tui` to skip the TUI entirely.
+If the TUI fails to start, an explicit `--tui` shows the error and exits. When the TUI was only auto-detected (stdout is a terminal), `tournament.py` prints a warning and falls back to plain-text mode. Use `--no-tui` to skip the TUI entirely.
 
 ## Environment
 

@@ -71,3 +71,12 @@ def test_explicit_tui_failure_is_not_swallowed(monkeypatch):
     ])
     with pytest.raises(ImportError):
         tournament.main()
+
+
+@pytest.mark.parametrize("a,b", [
+    ("@stockfish-0", "stockfish:0"),
+    ("stockfish", "stockfish:20"),
+    ("human", "human:Human"),
+])
+def test_aliases_share_one_elo_id(a, b):
+    assert player_id(a) == player_id(b)

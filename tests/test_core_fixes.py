@@ -107,3 +107,38 @@ def test_engines_closed_on_keyboard_interrupt():
     with pytest.raises(KeyboardInterrupt):
         match.play()
     assert engine.closed == 1
+
+
+def test_correction_after_illegal_marker_beats_earlier_mention():
+    board = chess.Board()
+    text = "I considered e2e4. MOVE: e2e5. Actually Nf3"
+    assert _extract_move(text, board) == "g1f3"
+
+
+def test_cleanup_closes_both_engines_and_keeps_original_error():
+    class _BadClose(_Closable):
+        def close(self):
+            super().close()
+            raise OSError("engine pipe broken")
+
+    class _ExplodingBadClose(_Exploding, _BadClose):
+        pass
+
+    white = _ExplodingBadClose()
+    black = _Closable()
+    match = ChessMatch(white, black, delay=0)
+    with pytest.raises(RuntimeError, match="player crashed"):
+        match.play()
+    assert white.closed == 1 and black.closed == 1
+
+
+def test_single_game_self_play_with_elo_does_not_crash(tmp_path):
+    import subprocess, sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, str(root / "chess_llm.py"), "-w", "random", "-b", "random",
+         "--delay", "0", "--elo", "--elo-db", str(tmp_path / "r.json")],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr

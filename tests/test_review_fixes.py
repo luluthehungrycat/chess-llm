@@ -89,9 +89,11 @@ def test_live_state_uses_update_sequence(tmp_path):
     second = chess.Board()
     with runner._lock:
         runner._live_sequence = 2
-        runner._live_state[1] = (first, "e4", "a", "b", 1, "White", 1)
-        runner._live_state[2] = (second, "d5", "b", "a", 1, "Black", 2)
-    assert runner.latest_live_state()[1] == "d5"
+        # Inserted first but updated most recently: sequence, not insertion
+        # order, must decide which board is shown.
+        runner._live_state[1] = (first, "e4", "a", "b", 1, "White", 2)
+        runner._live_state[2] = (second, "d5", "b", "a", 1, "Black", 1)
+    assert runner.latest_live_state()[1] == "e4"
 
 
 def test_error_results_are_not_completed(tmp_path):

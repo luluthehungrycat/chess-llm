@@ -43,6 +43,8 @@ class ELOComputer:
         return 0
 
     def update(self, white_id: str, black_id: str, result: str):
+        if white_id == black_id:
+            return  # self-play is unrated (matches elo.EloTracker)
         w = self._get(white_id)
         b = self._get(black_id)
 

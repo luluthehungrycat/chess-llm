@@ -301,11 +301,12 @@ class TestUpdateMethod:
         with pytest.raises(ValueError):
             tracker.update("white", "black", result)
 
-    def test_update_rejects_same_player_on_both_sides(self):
+    def test_self_play_is_unrated(self):
         tracker = EloTracker(":memory:")
-        with pytest.raises(ValueError):
-            tracker.update("player", "player", "1-0")
+        out = tracker.update("player", "player", "1-0")
+        assert out["skipped"] is True
         assert tracker.get("player")["games"] == 0
+        assert tracker.get("player")["rating"] == 1200
 
 
 class TestKFactorLogic:

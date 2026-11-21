@@ -394,6 +394,19 @@ def _extract_move(text: str, board: chess.Board) -> Optional[str]:
             pass
         if marked_fallback is None:
             marked_fallback = uci
+            marked_end = m.end()
+
+    # 1a'. The marked move was illegal: a correction usually follows it, so
+    #      search only the text after the marker before scanning everything
+    #      (otherwise a move merely "considered" earlier wins).
+    if marked_fallback is not None:
+        later = _extract_move(text[marked_end:], board)
+        if later is not None:
+            try:
+                if board.parse_uci(later) in board.legal_moves:
+                    return later
+            except ValueError:
+                pass
 
     # 1b. Try "make_move d6" or "my move: Nf6" style
     m = _MOVE_CMD_RE.search(text)
@@ -1050,9 +1063,13 @@ class StockfishPlayer:
         return result.move
 
     def close(self):
-        if self._engine:
-            self._engine.quit()
-            self._engine = None
+        engine, self._engine = self._engine, None
+        if engine:
+            try:
+                engine.quit()
+            except Exception:
+                engine.close()  # graceful quit failed: kill the transport
+                raise
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
@@ -1137,10 +1154,17 @@ class ChessMatch:
         return self.pgn_game.accept(exporter)
 
     def _cleanup(self):
-        """Close any engine-based players."""
+        """Close every engine-based player, even if an earlier close fails.
+
+        A close error is reported but never replaces the exception that
+        ended the match (that is the one the user needs to see).
+        """
         for p in (self.white, self.black):
             if hasattr(p, "close"):
-                p.close()
+                try:
+                    p.close()
+                except Exception as e:
+                    print(f"⚠ Failed to close {getattr(p, 'name', p)}: {e}", file=sys.stderr)
 
     def play(self) -> str:
         """Play the game until conclusion. Returns result string ('1-0', '0-1', '1/2-1/2').
