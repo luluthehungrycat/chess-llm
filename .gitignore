@@ -13,3 +13,21 @@ games/*.pgn
 # OS
 .DS_Store
 ratings.json
+
+# Test / tool caches
+.pytest_cache/
+.benchmarks/
+.logs/
+
+# Local agent-harness config (per-developer, not project code)
+.agents/
+.claude/
+.codex/
+.goose/
+.omp/
+.opencode/
+.pi/
+.slim/
+.vibe/
+skills/
+skills-lock.json
