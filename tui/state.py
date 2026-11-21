@@ -64,6 +64,8 @@ def compute_remaining_tasks(
     # Count completed games per (white, black) pair
     done_counts: dict[tuple[str, str], int] = {}
     for w, b, r in completed:
+        if r == "error":
+            continue
         key = (w, b)
         done_counts[key] = done_counts.get(key, 0) + 1
 

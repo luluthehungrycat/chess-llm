@@ -74,10 +74,10 @@ class TournamentRunner:
         self.openings_mode = openings_mode
 
         # Resume state
-        self._resume_completed = resume_completed or []
-        self._completed: list[tuple[str, str, str]] = [
-            item for item in self._resume_completed if item[2] != "error"
+        self._resume_completed = [
+            item for item in resume_completed or [] if item[2] != "error"
         ]
+        self._completed = list(self._resume_completed)
         self._failures: list[tuple[str, str, str]] = []
 
         # Compute the task list eagerly so .total_tasks is accurate before start()
@@ -198,10 +198,19 @@ class TournamentRunner:
                 board_copy = board.copy()
                 with self._lock:
                     self._final_state[task_id] = (board_copy, len(board_copy.move_stack))
+                    self._live_sequence += 1
+                    side = "White" if board_copy.turn == chess.WHITE else "Black"
+                    self._live_state[task_id] = (
+                        board_copy, san, wm, bm, board_copy.fullmove_number,
+                        side, self._live_sequence,
+                    )
                 self.moves.put((task_id, board_copy, san, wm, bm))
             return _on_move
 
         def _run_one(wm, bm):
+            self._pause_gate.wait()
+            if self._stop_flag.is_set():
+                return
             start_ts = time.time()
             with self._lock:
                 tid = self._task_id
@@ -301,7 +310,7 @@ class TournamentRunner:
         return processed
 
     def process_moves(self) -> list[tuple]:
-        """Drain the moves queue, update live board state.
+        """Drain the moves queue.
 
         Returns the full list of moves drained this cycle (for callers
         that want to inspect them). The most recent live state is
@@ -313,11 +322,5 @@ class TournamentRunner:
                 item = self.moves.get_nowait()
             except queue.Empty:
                 break
-            tid, board_copy, san, wm, bm = item
-            with self._lock:
-                fullmove = board_copy.fullmove_number
-                side = "White" if board_copy.turn == chess.WHITE else "Black"
-                self._live_sequence += 1
-                self._live_state[tid] = (board_copy, san, wm, bm, fullmove, side, self._live_sequence)
             drained.append(item)
         return drained

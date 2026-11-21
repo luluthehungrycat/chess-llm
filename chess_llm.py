@@ -1232,6 +1232,14 @@ class ChessMatch:
         for p in (self.white, self.black):
             if hasattr(p, "illegal_count"):
                 print(f"   {p.name}: {p.illegal_count} illegal move(s)")
+        # is_capture() needs the position *before* each move, so replay the
+        # game from its root (which may be an opening FEN, not the start).
+        replay = self.board.root()
+        captures = 0
+        for move in self.board.move_stack:
+            captures += replay.is_capture(move)
+            replay.push(move)
+        print(f"   Moves: {len(self.board.move_stack)} plies, Captures: {captures}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

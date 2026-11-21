@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+from itertools import count
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,31 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from elo import EloTracker
+from chess_llm import ChessMatch
+
+
+class _LiveChessMatch(ChessMatch):
+    """Expose committed moves at the match's turn and completion boundaries."""
+
+    def __init__(self, *args, on_move, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_move = on_move
+        self._reported_plies = len(self.board.move_stack)
+
+    def _report_move(self):
+        plies = len(self.board.move_stack)
+        if plies > self._reported_plies:
+            self._reported_plies = plies
+            self._on_move(self.board, self.node.san(), self.board.peek())
+
+    def _history_text(self):
+        self._report_move()
+        return super()._history_text()
+
+    def play(self):
+        result = super().play()
+        self._report_move()
+        return result
 
 
 def parse_player_spec(spec: str):
@@ -105,10 +131,10 @@ def run_match(white_spec: str, black_spec: str,
               log_dir: Optional[str] = None,
               starting_board = None,
               opening_name: str = "",
+              on_move=None,
+              quiet: bool = False,
               **player_kwargs) -> str:
     """Run a single match. Returns result string ('1-0', '0-1', '1/2-1/2')."""
-    from chess_llm import ChessMatch
-
     _, white, w_id, white_overrides = parse_player_spec(white_spec)
     _, black, b_id, black_overrides = parse_player_spec(black_spec)
 
@@ -134,17 +160,18 @@ def run_match(white_spec: str, black_spec: str,
             except Exception as e:
                 print(f"   ⚠ {p.name}: connectivity check failed: {e}")
 
-    if starting_board is not None and opening_name:
+    if not quiet:
         print(f"\n{'=' * 50}")
         print(f"  {white.name} (White)  vs  {black.name} (Black)")
-        print(f"  Opening: {opening_name}")
-        print(f"{'=' * 50}")
-    else:
-        print(f"\n{'=' * 50}")
-        print(f"  {white.name} (White)  vs  {black.name} (Black)")
+        if starting_board is not None and opening_name:
+            print(f"  Opening: {opening_name}")
         print(f"{'=' * 50}")
 
-    match = ChessMatch(white, black, delay=delay, starting_board=starting_board)
+    if on_move is None:
+        match = ChessMatch(white, black, delay=delay, starting_board=starting_board)
+    else:
+        match = _LiveChessMatch(white, black, delay=delay, starting_board=starting_board,
+                                on_move=on_move)
     result = match.play()
 
     # Save PGN
@@ -153,8 +180,19 @@ def run_match(white_spec: str, black_spec: str,
     b_name = black.name.replace("/", "_").replace(" ", "_")[:40]
     games_dir = "games"
     os.makedirs(games_dir, exist_ok=True)
-    pgn_path = f"{games_dir}/{ts}_{w_name}_vs_{b_name}.pgn"
-    match.save_pgn(pgn_path)
+    stem = f"{ts}_{w_name}_vs_{b_name}"
+    for index in count():
+        suffix = f"_{index}" if index else ""
+        pgn_path = Path(games_dir) / f"{stem}{suffix}.pgn"
+        try:
+            pgn_file = pgn_path.open("x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        with pgn_file:
+            print(match.pgn_game, file=pgn_file)
+        break
+    if not quiet:
+        print(f"\n📄 PGN saved to {pgn_path}")
 
     # ELO
     if elo_tracker:
