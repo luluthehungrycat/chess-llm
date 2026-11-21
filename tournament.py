@@ -31,7 +31,7 @@ from typing import Optional
 # Add parent to path so we can import chess_llm modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from elo import EloTracker
+from elo import EloTracker, player_id
 from chess_llm import ChessMatch
 
 
@@ -60,69 +60,32 @@ class _LiveChessMatch(ChessMatch):
 
 
 def parse_player_spec(spec: str):
-    """Parse a player spec string. Returns (player_type, player, label).
+    """Parse a player spec and build the player.
 
-    Handles @preset-name references and inline query flags from model_config.
-    Also resolves stockfish:skill and human:name syntax.
+    Returns (player_type, player, elo_id, overrides). Parsing is delegated to
+    chess_llm.parse_player, so @presets, ?flags and stockfish:N behave exactly
+    as in single games; unknown presets raise ValueError. ``overrides`` are
+    the per-model LLM kwargs (models.yaml defaults + preset + inline flags)
+    that win over global tournament flags.
     """
-    from model_config import resolve_model_spec, ModelConfig
-    from chess_llm import HumanPlayer, RandomPlayer, StockfishPlayer, LLMPlayer
+    from chess_llm import (HumanPlayer, LLMPlayer, LLM_PLAYER_KWARGS, RandomPlayer,
+                           StockfishPlayer, parse_player)
 
-    # Resolve @preset and ?query=val before dispatching
-    try:
-        resolved_model, inline_overrides = resolve_model_spec(spec)
-    except ValueError:
-        resolved_model, inline_overrides = spec, {}
-
-    if resolved_model.lower() == "human":
-        return "human", HumanPlayer(name="Human"), f"human-Human", {}
-    if resolved_model.startswith("human:"):
-        name = resolved_model.split(":", 1)[1].strip()
-        return "human", HumanPlayer(name=name), f"human-{name}", {}
-    if resolved_model.lower() == "random":
-        return "random", RandomPlayer(name="Random"), "random", {}
-    if resolved_model.lower() == "stockfish":
-        return "stockfish", StockfishPlayer(name="Stockfish 20", skill_level=20), "stockfish-20", {}
-    if resolved_model.startswith("stockfish:"):
-        skill_str = resolved_model.split(":", 1)[1].strip()
-        skill = int(skill_str) if skill_str else 20
-        name = f"Stockfish {skill}"
-        return "stockfish", StockfishPlayer(name=name, skill_level=skill), f"stockfish-{skill}", {}
-
-    # LLM player — apply inline overrides from ?query string
-    cfg = ModelConfig.load()
-    # Merge: model_config defaults → inline overrides
-    merged_kwargs = {**cfg.get_defaults(), **inline_overrides}
-    # use_tools and tiny interact: tiny forces no-tools
-    if merged_kwargs.get("tiny"):
-        merged_kwargs["use_tools"] = False
-
-    player = LLMPlayer(
-        model=resolved_model,
-        name=spec,  # preserve original spec as display name
-        **{k: v for k, v in merged_kwargs.items()
-           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain")},
-    )
-    return "llm", player, spec, merged_kwargs
+    ptype, kwargs = parse_player(spec)
+    elo_id = player_id(spec)
+    if ptype == "human":
+        return ptype, HumanPlayer(name=kwargs["name"]), elo_id, {}
+    if ptype == "random":
+        return ptype, RandomPlayer(name="Random"), elo_id, {}
+    if ptype == "stockfish":
+        player = StockfishPlayer(name=kwargs["name"], skill_level=kwargs["skill"])
+        return ptype, player, elo_id, {}
+    overrides = {k: v for k, v in kwargs.items() if k in LLM_PLAYER_KWARGS}
+    return ptype, LLMPlayer(**kwargs), elo_id, overrides
 
 
-def _elo_id_from_spec(spec: str) -> str:
-    """Extract the ELO key from a player spec WITHOUT creating a player instance."""
-    spec = spec.strip()
-    if spec.lower() == "random":
-        return "random"
-    if spec.lower() == "human":
-        return "human-Human"
-    if spec.startswith("human:"):
-        name = spec.split(":", 1)[1].strip()
-        return f"human-{name}"
-    if spec.lower() == "stockfish":
-        return "stockfish-20"
-    if spec.startswith("stockfish:"):
-        skill_str = spec.split(":", 1)[1].strip()
-        skill = int(skill_str) if skill_str else 20
-        return f"stockfish-{skill}"
-    return spec
+# Kept as a name for existing callers; the logic lives in elo.player_id.
+_elo_id_from_spec = player_id
 
 
 def run_match(white_spec: str, black_spec: str,
@@ -527,6 +490,28 @@ def main():
         sys.stdout = _Tee()
         print(f"📝 Logging to {args.log}")
 
+    # ── Normalise and validate player specs up front ──────────────────
+    # Bare "stockfish" takes --stockfish-skill; rewriting the spec keeps the
+    # player, its label and its ELO id in agreement everywhere downstream.
+    def _normalise(spec: str) -> str:
+        if spec.strip().lower() in ("stockfish", "stockfish:"):
+            return f"stockfish:{args.stockfish_skill}"
+        return spec
+
+    if args.round_robin:
+        args.round_robin = [_normalise(s) for s in args.round_robin]
+    if args.gauntlet:
+        args.gauntlet = _normalise(args.gauntlet)
+    if args.opponents:
+        args.opponents = [_normalise(s) for s in args.opponents]
+
+    from chess_llm import parse_player
+    for spec in (args.round_robin or []) + [args.gauntlet] * bool(args.gauntlet) + (args.opponents or []):
+        try:
+            parse_player(spec)
+        except ValueError as e:
+            parser.error(str(e))
+
     # Auto-detect TUI: use when stdout is a terminal unless explicitly disabled
     use_tui = args.tui if args.tui is not None else (
         sys.stdout.isatty() and args.no_tui is not True
@@ -596,6 +581,10 @@ def main():
             app.run()
             return
         except Exception as e:
+            if args.tui:
+                # Explicit --tui: the user asked for the dashboard, so show the
+                # real error instead of quietly running something else.
+                raise
             print(f"⚠ TUI failed to start: {e}", file=sys.stderr)
             print("Falling back to plain-text mode. Use --no-tui to skip this warning.", file=sys.stderr)
             # Fall through to non-TUI path below

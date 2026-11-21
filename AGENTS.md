@@ -39,7 +39,8 @@ tests/            pytest suite (conftest.py + 12 test_*.py modules)
 - **`MOVE:` marker extraction**: prefers a marked move that is legal; if the marked move is illegal, extraction falls through to later candidates.
 - **Engine cleanup**: `ChessMatch.play()` closes engine players in a `finally`, including on exceptions and Ctrl-C.
 - **Stockfish reuse**: `StockfishPlayer` starts the engine once and reuses it for every move.
-- **One player-spec parser**: `parse_player()` in `chess_llm.py` handles `@preset`, `?key=val`, `human[:name]`, `random`, `stockfish[:N]` (empty `N` = skill 20). Unknown presets or flags are errors (exit 2), never treated as model names. `tournament.py` still has its own `parse_player_spec()`; switching it to `parse_player()` is pending.
+- **One player-spec parser**: `parse_player()` in `chess_llm.py` handles `@preset`, `?key=val`, `human[:name]`, `random`, `stockfish[:N]` (empty `N` = skill 20). Unknown presets or flags are errors (exit 2), never treated as model names. `tournament.parse_player_spec()` is a thin wrapper that builds players from `parse_player()`.
+- **One tournament ELO id**: `elo.player_id(spec)` is the rating key for sequential, parallel and TUI tournament games. (Single games in `chess_llm.py` key LLMs by the resolved model string instead; unifying the two is still open.)
 
 ## Dependencies
 

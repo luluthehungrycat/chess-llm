@@ -25,6 +25,31 @@ DEFAULT_RATING = 1200
 PROVISIONAL_GAMES = 10    # games before switching from provisional K
 
 
+def player_id(spec: str) -> str:
+    """Stable ELO key for a tournament player spec, without creating a player.
+
+    The one source of truth for tournament.py (sequential and parallel) and
+    the TUI, so a player never ends up with two ratings.
+    """
+    spec = spec.strip()
+    low = spec.lower()
+    if low == "random":
+        return "random"
+    if low == "human":
+        return "human-Human"
+    if low.startswith("human:"):
+        return f"human-{spec.split(':', 1)[1].strip()}"
+    if low == "stockfish":
+        return "stockfish-20"
+    if low.startswith(("stockfish:", "stockfish-")):
+        suffix = spec[len("stockfish"):].lstrip("-:").strip()
+        if suffix == "":
+            return "stockfish-20"
+        if suffix.isdigit():
+            return f"stockfish-{int(suffix)}"
+    return spec
+
+
 class EloTracker:
     """Persistent ELO ratings for chess players (models, humans, engines)."""
 

@@ -15,26 +15,8 @@ from typing import Optional
 import chess
 
 
-def _elo_id(spec: str) -> str:
-    """Extract a stable ELO key from a player spec without creating a player.
-
-    Mirrors tournament._elo_id_from_spec and chess_llm._elo_id.
-    """
-    spec = spec.strip()
-    if spec.lower() == "random":
-        return "random"
-    if spec.lower() == "human":
-        return "human-Human"
-    if spec.startswith("human:"):
-        name = spec.split(":", 1)[1].strip()
-        return f"human-{name}"
-    if spec.lower() == "stockfish":
-        return "stockfish-20"
-    if spec.lower().startswith("stockfish-") or spec.lower().startswith("stockfish:"):
-        suffix = spec[len("stockfish"):].lstrip("-:").strip()
-        if suffix.isdigit():
-            return f"stockfish-{int(suffix)}"
-    return spec
+# Canonical ELO key, shared with tournament.py
+from elo import player_id as _elo_id  # noqa: E402
 
 
 class TournamentRunner:

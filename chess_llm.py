@@ -1252,16 +1252,16 @@ LLM_PLAYER_KWARGS = (
 )
 
 
-def _parse_stockfish(spec: str) -> Optional[tuple[str, dict[str, Any]]]:
-    """'stockfish' / 'stockfish:N' / 'stockfish:' (→ skill 20), else None."""
+def _parse_stockfish(spec: str, default_skill: int = 20) -> Optional[tuple[str, dict[str, Any]]]:
+    """'stockfish' / 'stockfish:N' / 'stockfish:' (→ default_skill), else None."""
     m = re.match(r"^stockfish(?::(\d*))?$", spec.strip(), re.IGNORECASE)
     if not m:
         return None
-    skill = int(m.group(1)) if m.group(1) else 20
+    skill = int(m.group(1)) if m.group(1) else default_skill
     return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
 
 
-def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
+def parse_player(spec: str, default_skill: int = 20) -> tuple[str, dict[str, Any]]:
     """
     Parse a player spec string into (type, kwargs) with model config support.
 
@@ -1280,7 +1280,7 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
     spec = spec.strip()
 
     # Check stockfish first (before model config resolution)
-    sf = _parse_stockfish(spec)
+    sf = _parse_stockfish(spec, default_skill)
     if sf:
         return sf
 
@@ -1298,7 +1298,7 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
         return "random", {"name": "Random"}
 
     # Stockfish (resolved from preset, e.g. @stockfish-0 → stockfish:0)
-    sf = _parse_stockfish(resolved_model)
+    sf = _parse_stockfish(resolved_model, default_skill)
     if sf:
         return sf
 
@@ -1486,7 +1486,7 @@ def main():
 
     # Build players
     def build_player(spec: str, color: str, per_player_flags: str | None = None):
-        ptype, kwargs = parse_player(spec)
+        ptype, kwargs = parse_player(spec, default_skill=args.stockfish_skill)
         # Parse per-player CLI flags: "tools=off,tiny=true,retries=10"
         from model_config import _parse_query_flags
         cli_overrides = _parse_query_flags(per_player_flags) if per_player_flags else {}
@@ -1496,7 +1496,7 @@ def main():
         elif ptype == "random":
             return RandomPlayer(name=f"Random ({color})")
         elif ptype == "stockfish":
-            skill = kwargs.get("skill", args.stockfish_skill)
+            skill = kwargs["skill"]
             return StockfishPlayer(
                 name=f"Stockfish {skill} ({color})",
                 skill_level=skill,
