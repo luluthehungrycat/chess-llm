@@ -53,7 +53,7 @@ python tournament.py --round-robin @qwen3-local @big-pickle @stockfish-10
 
 Flags you can set in a preset or inline (`?key=val`): `use_tools`/`tools`, `tiny`, `max_retries`/`retries`, `temperature`/`temp`, `timeout`, `reasoning` (`low`/`medium`/`high`/`none`), `constrain`.
 
-Merge priority, lowest to highest: `defaults:` → named preset → inline `?key=val` → `--white-flags` / `--black-flags` / `--model-flags`.
+Merge priority, lowest to highest: `defaults:` → named preset → inline `?key=val` → explicit global CLI flags → `--white-flags` / `--black-flags` / `--model-flags`.
 
 ## Usage
 
@@ -94,9 +94,9 @@ python tournament.py --round-robin @qwen3-local @big-pickle stockfish:5 --elo --
 # Gauntlet: one champion against several opponents
 python tournament.py --gauntlet @big-pickle --opponents @qwen3-local stockfish:10 --elo
 
-# Run 4 games at once, resume an interrupted run
-python tournament.py --round-robin @qwen3-local @big-pickle --parallel 4 --elo
-python tournament.py --round-robin @qwen3-local @big-pickle --resume
+# Save or quit from the TUI, then resume in plain text
+python tournament.py --round-robin @qwen3-local @big-pickle --parallel 4 --elo --tui
+python tournament.py --resume --no-tui
 
 # Force decisive games with unbalanced opening positions
 python tournament.py --round-robin stockfish:5 stockfish:10 --openings unbalanced
@@ -132,7 +132,7 @@ All games auto-save as PGN in `./games/` — load them in Lichess or Chess.com f
 | `--stockfish-skill` | `20` | Stockfish skill 0–20 (for `stockfish` without `:N`) |
 | `--stockfish-time` | `0.1` | Stockfish think time in seconds |
 | `--stockfish-threads` | all cores | Stockfish CPU threads |
-| `--stockfish-path` | auto | Stockfish binary (`chess_llm.py` only for now) |
+| `--stockfish-path` | auto | Path to the Stockfish binary |
 | `--api-base`, `--api-key` | provider default | Override endpoint and key (`LLM_CHESS_API_BASE`, `LLM_CHESS_API_KEY`) |
 
 ### `tournament.py`
@@ -148,7 +148,8 @@ All games auto-save as PGN in `./games/` — load them in Lichess or Chess.com f
 | `--delay` | `0.5` | Seconds between moves |
 | `--elo`, `--elo-db` | off, `ratings.json` | ELO tracking |
 | `--model-flags` | — | `key=val,...` applied to every LLM player |
-| `--resume` | off | Continue an unfinished tournament |
+| `--resume [CHECKPOINT]` | off | Continue a saved tournament. Omit the path for `tournament_state.json`. |
+| `--stockfish-path` | auto | Path to the Stockfish binary. The checkpoint retains this path for resume. |
 | `--tui` / `--no-tui` | auto | Force or disable the Textual UI (auto = TUI when stdout is a terminal) |
 | `--log`, `-l` | off | Tee output to a log file |
 | `--retries`, `--temperature`, `--timeout`, `--no-tools`, `--tiny`, `--constrain`, `--reasoning` | as in `chess_llm.py` | Defaults applied to LLM players |

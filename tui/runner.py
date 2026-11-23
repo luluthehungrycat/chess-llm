@@ -16,7 +16,8 @@ import chess
 
 
 # Canonical ELO key, shared with tournament.py
-from elo import player_id as _elo_id  # noqa: E402
+from elo import player_id as _elo_id
+from .state import ScheduledGame, build_schedule, _subtract_completed
 
 
 class TournamentRunner:
@@ -45,8 +46,8 @@ class TournamentRunner:
         elo_tracker,                    # EloTracker — single source of truth
         resume_completed: Optional[list[tuple[str, str, str]]] = None,
         openings_mode: str = "standard",
+        schedule: list[ScheduledGame] | None = None,
     ):
-        from .state import compute_remaining_tasks
         self.models = models
         self.games_per_pair = games_per_pair
         self.delay = delay
@@ -63,11 +64,11 @@ class TournamentRunner:
         self._failures: list[tuple[str, str, str]] = []
 
         # Compute the task list eagerly so .total_tasks is accurate before start()
-        self._task_list: list[tuple[str, str]] = compute_remaining_tasks(
-            models, games_per_pair, self._resume_completed
+        self._task_list = schedule if schedule is not None else _subtract_completed(
+            build_schedule(models, games_per_pair, openings_mode), self._resume_completed
         )
+        self._completed_task_ids: set[int] = set()
         self._active: dict[int, tuple[str, str, float]] = {}
-        self._task_id = 0
         self._lock = threading.Lock()
         self._stop_flag = threading.Event()
         self._pause_gate = threading.Event()
@@ -125,6 +126,12 @@ class TournamentRunner:
     def completed(self) -> list[tuple[str, str, str]]:
         return self._completed
 
+    def remaining_games(self) -> list[ScheduledGame]:
+        return [
+            game for task_id, game in enumerate(self._task_list)
+            if task_id not in self._completed_task_ids
+        ]
+
     def active_snapshot(self) -> dict[int, tuple[str, str, float]]:
         with self._lock:
             return dict(self._active)
@@ -147,26 +154,6 @@ class TournamentRunner:
         Designed to be run in a Textual @work(thread=True) worker thread.
         """
         import concurrent.futures
-        # Lazily import to avoid pulling in tournament.py at module load time
-        from openings import OPENINGS
-        import chess as _chess
-
-        openings_list = OPENINGS if self.openings_mode == "unbalanced" else None
-        _opening_idx = [0]
-        _opening_lock = threading.Lock()
-
-        def _get_opening():
-            if openings_list is None:
-                return None, ""
-            with _opening_lock:
-                idx = _opening_idx[0]
-                _opening_idx[0] += 1
-            name, moves, _adv = openings_list[idx % len(openings_list)]
-            board = _chess.Board()
-            for uci in moves:
-                board.push_uci(uci)
-            return board, name
-
         # Resolve run_match once
         import sys
         _mod = sys.modules.get("__main__")
@@ -189,24 +176,23 @@ class TournamentRunner:
                 self.moves.put((task_id, board_copy, san, wm, bm))
             return _on_move
 
-        def _run_one(wm, bm):
+        def _run_one(tid, game):
+            wm, bm = game.white, game.black
             self._pause_gate.wait()
             if self._stop_flag.is_set():
                 return
             start_ts = time.time()
             with self._lock:
-                tid = self._task_id
-                self._task_id += 1
                 self._active[tid] = (wm, bm, start_ts)
 
-            board, oname = _get_opening()
             on_move_cb = _on_move_factory(tid, wm, bm)
 
             try:
+                board = game.starting_board()
                 result = _run_match_fn(
                     wm, bm,
                     delay=self.delay, elo_tracker=None,
-                    starting_board=board, opening_name=oname,
+                    starting_board=board, opening_name=game.opening_name,
                     on_move=on_move_cb,
                     quiet=True,
                     **self.player_kwargs,
@@ -223,9 +209,9 @@ class TournamentRunner:
                     pgn_fen = board.fen() if board else ""
                     move_count = len(board.move_stack) if board else 0
 
-                self.results.put((wm, bm, result, duration, pgn_fen, move_count))
+                self.results.put((wm, bm, result, duration, pgn_fen, move_count, tid))
             except Exception as e:
-                self.results.put((wm, bm, "error", 0.0, "", 0))
+                self.results.put((wm, bm, "error", 0.0, "", 0, tid))
                 with open("/tmp/tui_worker.log", "a") as _wf:
                     _wf.write(f"[runner] Task {wm} vs {bm} FAILED: {e}\n")
                     import traceback
@@ -240,13 +226,13 @@ class TournamentRunner:
             max_workers=self.max_workers
         ) as executor:
             futures = []
-            for wm, bm in self._task_list:
+            for tid, game in enumerate(self._task_list):
                 if self._stop_flag.is_set():
                     break
                 self._pause_gate.wait()
                 if self._stop_flag.is_set():
                     break
-                futures.append(executor.submit(_run_one, wm, bm))
+                futures.append(executor.submit(_run_one, tid, game))
             for future in concurrent.futures.as_completed(futures):
                 if self._stop_flag.is_set():
                     break
@@ -270,8 +256,9 @@ class TournamentRunner:
                 item = self.results.get_nowait()
             except queue.Empty:
                 break
-            if len(item) == 6:
-                white, black, result, duration, pgn_fen, move_count = item
+            task_id = item[6] if len(item) == 7 else None
+            if len(item) >= 6:
+                white, black, result, duration, pgn_fen, move_count = item[:6]
             else:
                 # Backwards-compat with shorter tuples
                 white, black, result = item[:3]
@@ -286,6 +273,8 @@ class TournamentRunner:
                 w_id = _elo_id(white)
                 b_id = _elo_id(black)
                 self.elo_tracker.update(w_id, b_id, result)
+                if task_id is not None:
+                    self._completed_task_ids.add(task_id)
                 for pid in (w_id, b_id):
                     self._game_durations.setdefault(pid, []).append(duration)
             processed.append((white, black, result, duration, pgn_fen, move_count))

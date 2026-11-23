@@ -1,11 +1,11 @@
-# Handoff — 2026-11-21
+# Handoff — 2026-11-23
 
 For the next coding agent working in this repo. Read this first, then `AGENTS.md`.
 
 ## Current state
 
-- Branch `chore/repo-health` (based on `a15ef62`, local only, not pushed, no PR). All work is committed.
-- Tests (`.venv/bin/python -m pytest -q tests`): **186 passed, 1 skipped, 6 xfailed.** The skips and xfails are unbuilt features (see below), not failures.
+- Branch `chore/repo-health` (based on `a15ef62`), open as PR #3 against `main`.
+- Tests (`.venv/bin/python -m pytest -q -p no:warnings tests`): **197 passed, 1 skipped, 6 xfailed.** The skips and xfails are unbuilt features (see below), not failures.
 - CI (`.github/workflows/ci.yml`) installs Stockfish, runs pytest on Python 3.11–3.13, and runs a random-vs-random smoke game with no `|| true`.
 
 ## What this branch did
@@ -15,27 +15,24 @@ For the next coding agent working in this repo. Read this first, then `AGENTS.md
 - **Engine cleanup**: `ChessMatch.play()` closes both engines in a `finally`. A failing `close()` is reported but never hides the error that ended the match, and never stops the other engine closing.
 - **`MOVE:` extraction**: a legal marked move wins. After an illegal marker, a legal move written *after* it wins next, before the rest of the text is scanned.
 - **One parser**: `chess_llm.parse_player()` is used by both CLIs (`tournament.parse_player_spec()` only builds players from it). Unknown `@presets` exit 2 before any game starts. `--stockfish-skill` applies to bare `stockfish` in both CLIs.
-- **ELO**: Black uses Black's expected score; unknown results raise; self-play (same id on both sides) is left unrated. `elo.player_id(spec)` is the one rating key for sequential, parallel and TUI tournament games, and preset aliases (`@stockfish-0` = `stockfish:0`) share it.
-- **Tournament/TUI**: unique PGN names for parallel games, live board fixes, resume retries failed games, explicit `--tui` fails loudly (auto-detected TUI still falls back).
+- **LLM settings**: Explicit global CLI flags override model settings. Per-player flags take priority, and tiny mode disables tools after merging.
+- **ELO**: Black uses Black's expected score, unknown results raise, and self-play leaves ratings unchanged. Both CLIs use the resolved model for LLM ratings and the same IDs for non-LLM players.
+- **Tournament/TUI**: Both modes share a schedule. Checkpoints store pending games and openings and can resume in plain text or the TUI. The ratings file is the source of truth: each finished game is applied to it once (the TUI also checkpoints after every game), never overwritten with a checkpoint snapshot. Tournament `--stockfish-path` is saved with the other player options.
 - **Repo**: deps aligned (`pyproject.toml`, `requirements.txt`), `.gitignore` for local agent tooling, docs refreshed, unbuilt-feature tests marked xfail/skip.
 
 ## Known gaps (found in review, not fixed)
 
-1. **Kwarg merge priority**: `models.yaml` `defaults:` beat explicit global CLI flags (`--timeout`, `--retries`, `--temperature`) in both CLIs, against the documented priority. In tournaments, `--tiny` set via global flags is applied after construction, so it does not force tools off. Fix: argparse defaults of `None`, merge every layer before constructing the player, then apply the tiny rule.
-2. **TUI gauntlet schedules opponent-vs-opponent games** (`tui/state.py` builds round-robin pairs). Plain-text mode is correct. Both should use one pairing schedule, persisted for resume.
-3. **Resume**: `--resume --no-tui` without players exits without loading the checkpoint. TUI resume reads `openings_mode` from the ELO dict, and the checkpoint never saves it, so `unbalanced` resumes as `standard`.
-4. **No `--stockfish-path` in `tournament.py`**; engines with a custom binary location cannot be used there.
-5. **Unknown `?key=val` flags are ignored** (a typo like `?retrise=5` passes silently). `tests/test_parse_player_parity.py` currently asserts this behaviour.
-6. **Two ELO-key schemes**: single games key LLMs by the resolved model string, tournaments by the spec. Both share `ratings.json`.
-7. **`ratings.json` needs a reset**: values were computed with the old Black-expected-score bug. Move it aside before the next `--elo` run.
-8. **Not built** (tests xfail/skip): ChessMatch callbacks, clock/time control, max-moves adjudication, resignation.
-9. **God file**: `chess_llm.py` (~1650 lines), with a ~240-line `LLMPlayer.get_move()` and a ~310-line `main()`.
-10. **`feat/tui-overhaul`** is unmerged and left as-is; only its CI idea was taken.
+1. **Unknown `?key=val` flags are ignored** (a typo like `?retrise=5` passes silently). `tests/test_parse_player_parity.py` currently asserts this behaviour.
+2. **Parallel Ctrl-C**: `_run_schedule` submits every game up front; on Ctrl-C the executor still waits for queued games, which can write PGNs that the checkpoint still lists as pending. Bound submissions and cancel queued work on interrupt.
+3. **Legacy checkpoints** (written before the merge-priority fix) stored argparse defaults such as `timeout: 120` as explicit flags, so on resume they now beat preset values. Checkpoints are not versioned.
+4. **Rating keys of odd specs**: ids come from the spec string, not the parsed player type, so an LLM spec like `human-Kai` shares the key of `human:Kai`. Old preset-keyed rows (`@qwen3-local`) are not migrated; `ratings.json` was reset on 2026-11-23, so only other DB files are affected.
+5. **Unbuilt features** (tests xfail/skip) include ChessMatch callbacks, clock/time control, max-moves adjudication, and resignation.
+6. **Large CLI module**: `chess_llm.py` contains the LLM player, retry loop, and single-game CLI.
+7. **`feat/tui-overhaul`** stays unmerged: as a whole it reintroduces the stderr redirect, the `ThreadPoolExecutor` timeout and unprotected engine cleanup. Worth porting piecemeal: `--max-moves` adjudication, the Ollama context-window warning, a configurable Stockfish startup timeout, per-player timing in the TUI.
 
 ## Next steps
 
-1. Push `chore/repo-health` and open a PR against `main`.
-2. Fix gap 1 (merge priority), then gaps 2–3 (TUI gauntlet, resume).
-3. Decide gap 5 (reject unknown flags) and gap 6 (one ELO-key scheme).
-4. Split `chess_llm.py` (LLM player, retry loop, CLI).
-5. Keep the xfail markers for unbuilt features until the features exist.
+1. Merge PR #3.
+2. Decide whether to reject unknown flags.
+3. Split `chess_llm.py` into the LLM player, retry loop, and CLI.
+4. Keep the xfail markers for unbuilt features until the features exist.

@@ -1285,7 +1285,13 @@ def _parse_stockfish(spec: str, default_skill: int = 20) -> Optional[tuple[str, 
     return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
 
 
-def parse_player(spec: str, default_skill: int = 20) -> tuple[str, dict[str, Any]]:
+def parse_player(
+    spec: str,
+    default_skill: int = 20,
+    *,
+    global_flags: dict | None = None,
+    per_player_flags: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     """
     Parse a player spec string into (type, kwargs) with model config support.
 
@@ -1299,7 +1305,7 @@ def parse_player(spec: str, default_skill: int = 20) -> tuple[str, dict[str, Any
       @preset-name          — Resolved from models.yaml
       provider/model        — LLMPlayer (with optional ?flags)
     """
-    from model_config import resolve_model_spec, ModelConfig
+    from model_config import resolve_model_spec, merge_llm_flags
 
     spec = spec.strip()
 
@@ -1309,8 +1315,7 @@ def parse_player(spec: str, default_skill: int = 20) -> tuple[str, dict[str, Any
         return sf
 
     # Resolve @preset-name or inline query flags via model_config.
-    # A ValueError here (unknown @preset, unknown ?flag) propagates: silently
-    # treating "@typo" as a literal LLM model name hid user mistakes.
+    # Unknown presets raise ValueError before a player is constructed.
     resolved_model, inline_overrides = resolve_model_spec(spec)
 
     if resolved_model.lower() == "human":
@@ -1326,16 +1331,10 @@ def parse_player(spec: str, default_skill: int = 20) -> tuple[str, dict[str, Any
     if sf:
         return sf
 
-    # LLM player — merge model_config defaults with inline overrides
-    cfg = ModelConfig.load()
-    merged_kwargs = {**cfg.get_defaults(), **inline_overrides}
-    if merged_kwargs.get("tiny"):
-        merged_kwargs["use_tools"] = False
-
     return "llm", {
         "model": resolved_model,
-        "name": spec,  # preserve original spec as display name
-        **{k: v for k, v in merged_kwargs.items() if k in LLM_PLAYER_KWARGS},
+        "name": spec,
+        **merge_llm_flags(resolved_model, inline_overrides, global_flags, per_player_flags),
     }
 
 
@@ -1382,16 +1381,16 @@ def main():
         help="PGN output file (default: auto-generated in ./games/)",
     )
     parser.add_argument(
-        "--no-tools", action="store_true",
+        "--no-tools", action="store_true", default=None,
         help="Disable tool calling — use text parsing instead (for models that don't support tools)",
     )
     parser.add_argument(
-        "--tiny", action="store_true",
+        "--tiny", action="store_true", default=None,
         help="Tiny-model mode: compact UCI-only prompt for models <20B. "
              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.",
     )
     parser.add_argument(
-        "--constrain", action="store_true",
+        "--constrain", action="store_true", default=None,
         help="Force legal moves: when the model proposes an illegal move, "
              "pick the closest legal move instead of retrying or forfeiting. "
              "Use this for tiny/quantized models that can't learn from retry feedback.",
@@ -1403,7 +1402,7 @@ def main():
              "Use \"none\" to explicitly disable reasoning for supported models.",
     )
     parser.add_argument(
-        "--temperature", "-t", type=float, default=0.3,
+        "--temperature", "-t", type=float, default=None,
         help="LLM temperature (default: 0.3)",
     )
     parser.add_argument(
@@ -1417,11 +1416,11 @@ def main():
              "(e.g. tools=on,retries=3). Overrides global flags for black only.",
     )
     parser.add_argument(
-        "--retries", "-r", type=int, default=3,
+        "--retries", "-r", type=int, default=None,
         help="Max illegal-move retries before forfeit (default: 3)",
     )
     parser.add_argument(
-        "--timeout", type=int, default=120,
+        "--timeout", type=int, default=None,
         help="API timeout in seconds (default: 120, increase for slow local models)",
     )
     parser.add_argument(
@@ -1508,12 +1507,21 @@ def main():
     if args.model:
         args.white = args.black = args.model
 
-    # Build players
+    global_flags = dict(
+        use_tools=False if args.no_tools else None,
+        max_retries=args.retries,
+        temperature=args.temperature,
+        timeout=args.timeout,
+        tiny=args.tiny,
+        reasoning=args.reasoning,
+        constrain=args.constrain,
+    )
+
     def build_player(spec: str, color: str, per_player_flags: str | None = None):
-        ptype, kwargs = parse_player(spec, default_skill=args.stockfish_skill)
-        # Parse per-player CLI flags: "tools=off,tiny=true,retries=10"
-        from model_config import _parse_query_flags
-        cli_overrides = _parse_query_flags(per_player_flags) if per_player_flags else {}
+        ptype, kwargs = parse_player(
+            spec, default_skill=args.stockfish_skill,
+            global_flags=global_flags, per_player_flags=per_player_flags,
+        )
         if ptype == "human":
             name = kwargs.get("name", "Human")
             return HumanPlayer(name=f"{name} ({color})")
@@ -1528,47 +1536,13 @@ def main():
                 threads=args.stockfish_threads,
                 binary_path=args.stockfish_path,
             )
-        else:
-            name = f"{kwargs['model']} ({color})"
-            # Merge: global CLI args → model_config defaults → preset → inline query → per-player flags
-            # Lower priority first, higher priority overwrites
-            effective_timeout = args.timeout
-            # Auto-bump timeout for verbose reasoning models
-            if kwargs["model"].startswith("bigpickle/") and effective_timeout == 120:
-                effective_timeout = 240
-
-            # Start with CLI global flags
-            merged: dict[str, Any] = dict(
-                use_tools=not args.no_tools and not args.tiny,
-                max_retries=args.retries,
-                temperature=args.temperature,
-                timeout=effective_timeout,
-                tiny=args.tiny,
-                reasoning=args.reasoning,
-                constrain=args.constrain,
-            )
-            # Overlay kwargs from parse_player (model_config defaults + preset + inline query)
-            for key in LLM_PLAYER_KWARGS:
-                if key in kwargs:
-                    merged[key] = kwargs[key]
-            # Per-player CLI flags win over everything
-            merged.update(cli_overrides)
-            # tiny forces no-tools
-            if merged.get("tiny"):
-                merged["use_tools"] = False
-
-            return LLMPlayer(
-                model=kwargs["model"],
-                name=name,
-                api_base=args.api_base,
-                api_key=args.api_key,
-                **merged,
-            )
+        kwargs["name"] = f"{kwargs['model']} ({color})"
+        return LLMPlayer(api_base=args.api_base, api_key=args.api_key, **kwargs)
 
     try:
         white = build_player(args.white, "White", args.white_flags)
         black = build_player(args.black, "Black", args.black_flags)
-    except ValueError as e:  # unknown @preset / ?flag — fail loud, exit 2
+    except ValueError as e:
         parser.error(str(e))
 
     # Pre-flight connectivity checks for LLM players
@@ -1576,23 +1550,15 @@ def main():
         if hasattr(p, "check_connectivity"):
             p.check_connectivity()
 
-    tools_label = "off" if args.no_tools or args.tiny else "on"
-    if args.tiny:
-        tools_label += " (tiny mode)"
-    # Detect auto-compact prompt for verbose reasoning models
-    # (big-pickle, deepseek-v4-flash-free, etc.)
-    _auto_compact = False
-    for p in (white, black):
-        if hasattr(p, "model") and p.model.startswith("bigpickle/"):
-            if ("big-pickle" in p.model or "deepseek" in p.model):
-                if not args.tiny and not args.no_tools:
-                    _auto_compact = True
-    prompt_style = "compact (reasoning model)" if _auto_compact else "full"
     print(f"\n♟  LLM Chess Match")
     print(f"   White: {white.name}")
     print(f"   Black: {black.name}")
-    print(f"   Delay: {args.delay}s  |  Retries: {args.retries}  |  "
-          f"Tools: {tools_label}  |  Prompt: {prompt_style}")
+    print(f"   Delay: {args.delay}s")
+    for player in (white, black):
+        if isinstance(player, LLMPlayer):
+            tools = "on" if player.use_tools else "off"
+            tiny = " (tiny mode)" if player.tiny else ""
+            print(f"   {player.name}: Retries: {player.max_retries}  |  Tools: {tools}{tiny}")
 
     match = ChessMatch(white, black, delay=args.delay)
     result = match.play()
@@ -1609,26 +1575,11 @@ def main():
 
     # ── ELO tracking ─────────────────────────────────────────────────
     if args.elo:
-        from elo import EloTracker
+        from elo import EloTracker, player_id
         tracker = EloTracker(args.elo_db)
 
-        def _elo_id(player) -> str:
-            """Extract a clean ELO ID from a player instance."""
-            if hasattr(player, "model"):
-                return player.model  # LLMPlayer: use the raw model string
-            if hasattr(player, "skill_level"):
-                return f"stockfish-{player.skill_level}"  # StockfishPlayer
-            name = player.name
-            # Strip color suffix: "mo (White)" → "mo"
-            if " (" in name:
-                name = name[: name.rindex(" (")] 
-            # Prefix human players to avoid collisions with model names
-            if name.lower() not in ("random",):
-                name = f"human-{name}"
-            return name
-
-        w_id = _elo_id(white)
-        b_id = _elo_id(black)
+        w_id = player_id(args.white, default_skill=args.stockfish_skill)
+        b_id = player_id(args.black, default_skill=args.stockfish_skill)
         w_old = tracker.get(w_id)["rating"]
         b_old = tracker.get(b_id)["rating"]
         updated = tracker.update(w_id, b_id, result)

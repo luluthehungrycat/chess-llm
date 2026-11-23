@@ -5,7 +5,7 @@
 Python chess engine that pits LLMs, humans, Stockfish and random players against each other. No web server, no database. Two CLIs:
 
 - `chess_llm.py` — single game, Unicode board in the terminal, PGN saved to `games/`.
-- `tournament.py` — round-robin / gauntlet runs with ELO tracking, optional Textual TUI.
+- `tournament.py` — round-robin / gauntlet runs with ELO tracking, optional Textual TUI and `--stockfish-path` for custom engine binaries.
 
 ## Architecture
 
@@ -39,8 +39,8 @@ tests/            pytest suite (conftest.py + 12 test_*.py modules)
 - **`MOVE:` marker extraction**: prefers a marked move that is legal; if the marked move is illegal, extraction falls through to later candidates.
 - **Engine cleanup**: `ChessMatch.play()` closes engine players in a `finally`, including on exceptions and Ctrl-C.
 - **Stockfish reuse**: `StockfishPlayer` starts the engine once and reuses it for every move.
-- **One player-spec parser**: `parse_player()` in `chess_llm.py` handles `@preset`, `?key=val`, `human[:name]`, `random`, `stockfish[:N]` (empty `N` = skill 20). Unknown `@presets` are errors (exit 2), never treated as model names; unknown `?key=val` flags are currently ignored (a typo like `?retrise=5` passes silently). `tournament.parse_player_spec()` is a thin wrapper that builds players from `parse_player()`.
-- **One tournament ELO id**: `elo.player_id(spec)` is the rating key for sequential, parallel and TUI tournament games. (Single games in `chess_llm.py` key LLMs by the resolved model string instead; unifying the two is still open.)
+- **One player-spec parser**: `parse_player()` in `chess_llm.py` handles `@preset`, `?key=val`, `human[:name]`, `random`, `stockfish[:N]` (empty `N` = skill 20). Unknown `@presets` are errors (exit 2), never treated as model names; unknown `?key=val` flags are currently ignored (a typo like `?retrise=5` passes silently). Both CLIs merge model settings and CLI flags before constructing players. Tiny mode then disables tools.
+- **Shared ELO IDs**: Both CLIs and the TUI use `elo.player_id(spec)`. LLM presets and inline overrides share the resolved model’s rating.
 
 ## Dependencies
 
@@ -75,7 +75,7 @@ CI (`.github/workflows/ci.yml`) runs pytest on Python 3.11–3.13 and the smoke 
   python chess_llm.py -w llama-cpp/model --white-flags "tiny=true,retries=10"
   python tournament.py --round-robin @qwen3-local @big-pickle --model-flags "timeout=180"
   ```
-  Merge priority (lowest → highest): `defaults:` in models.yaml → named preset → inline `?key=val` → `--white-flags` / `--black-flags` / `--model-flags`.
+  Merge priority (lowest → highest): `defaults:` in models.yaml → named preset → inline `?key=val` → explicit global CLI flags → `--white-flags` / `--black-flags` / `--model-flags`.
 - **Ollama**: `ollama/` routes through Ollama's `/v1` endpoint, not litellm's native handler (which has [tool-calling bugs](https://github.com/BerriAI/litellm/issues/13823)). The model must be pulled and the server running. Default base URL `http://localhost:11434/v1`; override with `--api-base`.
 - **Ollama context window**: small default contexts (2K) overflow on the growing prompt. Raise `num_ctx` in a Modelfile. A model that goes silent mid-game usually means context overflow.
 - **Docker Model Runner**: `docker/` routes to `/engines/v1` (port 12434). Models use the `ai/` namespace, e.g. `docker/ai/ministral3:3B-Q4_K_M`. Default context is 4K for GGUF models; raise with `docker model configure --ctx-size 8192 ai/<model>`.

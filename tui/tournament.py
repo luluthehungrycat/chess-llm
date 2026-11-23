@@ -17,7 +17,7 @@ from elo import EloTracker
 from .board import BoardWidget
 from .common import TUI_CSS
 from .runner import TournamentRunner, _elo_id
-from .state import save_state, clear_state
+from .state import STATE_FILE, ScheduledGame, save_state, clear_state
 
 
 class ELOComputer:
@@ -109,6 +109,8 @@ class TournamentApp(App):
         resume_completed: Optional[list[tuple[str, str, str]]] = None,
         resume_elo: Optional[dict] = None,
         openings_mode: str = "standard",
+        schedule: list[ScheduledGame] | None = None,
+        checkpoint_path: str = STATE_FILE,
     ):
         super().__init__()
         self.models = models
@@ -118,12 +120,13 @@ class TournamentApp(App):
         self.player_kwargs = player_kwargs
         self.max_workers = max_workers
         self.openings_mode = openings_mode
+        self.checkpoint_path = checkpoint_path
 
         self._resume_elo = resume_elo or {}
         self.elo = ELOComputer()
         self.runner = TournamentRunner(
             models, games_per_pair, delay, max_workers, player_kwargs, self.elo,
-            resume_completed=resume_completed, openings_mode=openings_mode,
+            resume_completed=resume_completed, openings_mode=openings_mode, schedule=schedule,
         )
         self._tournament_started_at = 0.0
         self._paused = False
@@ -131,6 +134,10 @@ class TournamentApp(App):
         self._show_board = True
         self._last_board_fen: str | None = None
         self._last_game_info = ""
+        # Games finished in this session but not yet written to elo_db_path.
+        # The ratings file is the source of truth: these are replayed onto it,
+        # never a whole-dict snapshot (which would erase newer ratings).
+        self._unsaved_games: list[tuple[str, str, str]] = []
 
     # ── Compose ──────────────────────────────────────────────────────────
 
@@ -153,8 +160,9 @@ class TournamentApp(App):
     # ── Mount ────────────────────────────────────────────────────────────
 
     def on_mount(self):
-        # A resumed tournament includes its most recently saved ratings.
-        if self._resume_elo:
+        # The live ratings file wins; the checkpoint snapshot is only a display
+        # fallback when ELO is not persisted.
+        if not self.elo_db_path and self._resume_elo:
             self.elo.ratings = self._resume_elo
         elif self.elo_db_path:
             loaded = self.elo.load_existing(self.elo_db_path)
@@ -182,12 +190,20 @@ class TournamentApp(App):
         """Drain worker events and refresh the dashboard."""
         self.runner.process_moves()
         finished = self.runner.is_finished()
+        new_results = False
         for white, black, result, _, fen, _ in self.runner.process_results():
             if result == "error":
                 self._tui_log(f"Game failed: {white} vs {black}")
-            elif fen:
+                continue
+            self._unsaved_games.append((white, black, result))
+            new_results = True
+            if fen:
                 self._last_board_fen = fen
                 self._last_game_info = f"{white} vs {black} · {result}"
+        if new_results and not self.runner.is_complete():
+            # Persist after every finished game so a crash cannot replay it.
+            self._save_elo()
+            self._save_checkpoint()
 
         self._update_progress()
         self._update_active_games()
@@ -317,20 +333,19 @@ class TournamentApp(App):
         widget.update("\n".join(lines))
 
     def _save_elo(self):
-        """Save accumulated ELO ratings to disk.
+        """Apply this session's unsaved games to the live ratings file.
 
-        Since we loaded existing ratings at startup and accumulated new games
-        in-memory, self.elo.ratings already contains the correct merged data
-        (old ratings + new games). Just write it out.
+        Reloads the file and replays only the new games, so ratings written by
+        other runs since this one started are kept, and each game counts once.
         """
-        if self.elo_db_path and self.elo.ratings:
-            from elo import EloTracker
-            tracker = EloTracker(self.elo_db_path)
-            # Replace tracker's in-memory dict with our accumulated data
-            tracker._ratings = self.elo.ratings
-            tracker._save()
-            return True
-        return False
+        if not self.elo_db_path or not self._unsaved_games:
+            return False
+        from elo import EloTracker, player_id
+        tracker = EloTracker(self.elo_db_path)
+        for white, black, result in self._unsaved_games:
+            tracker.update(player_id(white), player_id(black), result)
+        self._unsaved_games.clear()
+        return True
 
     def _on_complete(self):
         """Tournament finished — show final state and save ELO."""
@@ -339,7 +354,7 @@ class TournamentApp(App):
         )
         if self._save_elo():
             self.notify(f"ELO saved to {self.elo_db_path}", title="✅ Done")
-        clear_state()
+        clear_state(self.checkpoint_path)
 
     # ── Actions ──────────────────────────────────────────────────────────
 
@@ -368,7 +383,15 @@ class TournamentApp(App):
 
     def action_save(self):
         """Save tournament progress to disk for later resume."""
-        path = save_state(
+        self._poll()
+        if self.runner.is_complete():
+            return
+        self._save_elo()
+        path = self._save_checkpoint()
+        self.notify(f"Saved {len(self.runner.completed)} games to {path}", title="💾 Saved")
+
+    def _save_checkpoint(self):
+        return save_state(
             models=self.models,
             games_per_pair=self.games_per_pair,
             delay=self.delay,
@@ -378,5 +401,7 @@ class TournamentApp(App):
             elo_ratings=self.elo.ratings,
             elo_db_path=self.elo_db_path,
             started_at=self._tournament_started_at,
+            openings_mode=self.openings_mode,
+            remaining_games=self.runner.remaining_games(),
+            path=self.checkpoint_path,
         )
-        self.notify(f"Saved {len(self.runner.completed)} games to {path}", title="💾 Saved")

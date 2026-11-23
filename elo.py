@@ -25,23 +25,14 @@ DEFAULT_RATING = 1200
 PROVISIONAL_GAMES = 10    # games before switching from provisional K
 
 
-def player_id(spec: str) -> str:
-    """Stable ELO key for a tournament player spec, without creating a player.
+def player_id(spec: str, *, default_skill: int = 20) -> str:
+    """Return the shared ELO key for a player spec without creating a player."""
+    from model_config import resolve_model_spec
 
-    The one source of truth for tournament.py (sequential and parallel) and
-    the TUI, so a player never ends up with two ratings.
-    """
     spec = spec.strip()
-    if spec.startswith("@"):
-        # @stockfish-0 and stockfish:0 are the same engine → same rating.
-        # LLM presets keep the preset spec as their id.
-        try:
-            from model_config import resolve_model_spec
-            resolved, _ = resolve_model_spec(spec)
-        except ValueError:
-            return spec
-        if player_id(resolved) != resolved or resolved.lower() == "random":
-            return player_id(resolved)
+    try:
+        spec, _ = resolve_model_spec(spec)
+    except ValueError:
         return spec
     low = spec.lower()
     if low == "random":
@@ -51,11 +42,11 @@ def player_id(spec: str) -> str:
     if low.startswith("human:"):
         return f"human-{spec.split(':', 1)[1].strip()}"
     if low == "stockfish":
-        return "stockfish-20"
+        return f"stockfish-{default_skill}"
     if low.startswith(("stockfish:", "stockfish-")):
         suffix = spec[len("stockfish"):].lstrip("-:").strip()
         if suffix == "":
-            return "stockfish-20"
+            return f"stockfish-{default_skill}"
         if suffix.isdigit():
             return f"stockfish-{int(suffix)}"
     return spec
