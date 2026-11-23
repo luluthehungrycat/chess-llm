@@ -272,6 +272,12 @@ def _resume_plain(state, config, schedule, path):
     return results
 
 
+_RESUMABLE_PLAYER_KWARGS = frozenset({
+    "use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning",
+    "constrain", "model_flags", "threads", "think_time",
+})
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="LLM Chess Tournament Runner",
@@ -414,6 +420,14 @@ def main():
                 parser.error(f"checkpoint not found: {args.resume}")
             config = state["config"]
             config.setdefault("openings_mode", "standard")
+            # A checkpoint is data, not a command line: keep only known
+            # player options, and never take an executable path from it.
+            # The engine binary comes from this run's --stockfish-path.
+            kwargs = config.get("player_kwargs") or {}
+            config["player_kwargs"] = {
+                k: v for k, v in kwargs.items() if k in _RESUMABLE_PLAYER_KWARGS
+            }
+            config["player_kwargs"]["binary_path"] = args.stockfish_path
             schedule = restore_schedule(state)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             parser.error(f"could not load checkpoint {args.resume}: {exc}")

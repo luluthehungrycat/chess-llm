@@ -17,7 +17,7 @@ For the next coding agent working in this repo. Read this first, then `AGENTS.md
 - **One parser**: `chess_llm.parse_player()` is used by both CLIs (`tournament.parse_player_spec()` only builds players from it). Unknown `@presets` exit 2 before any game starts. `--stockfish-skill` applies to bare `stockfish` in both CLIs.
 - **LLM settings**: Explicit global CLI flags override model settings. Per-player flags take priority, and tiny mode disables tools after merging.
 - **ELO**: Black uses Black's expected score, unknown results raise, and self-play leaves ratings unchanged. Both CLIs use the resolved model for LLM ratings and the same IDs for non-LLM players.
-- **Tournament/TUI**: Both modes share a schedule. Checkpoints store pending games and openings and can resume in plain text or the TUI. The ratings file is the source of truth: each finished game is applied to it once (the TUI also checkpoints after every game), never overwritten with a checkpoint snapshot. Tournament `--stockfish-path` is saved with the other player options.
+- **Tournament/TUI**: Both modes share a schedule. Checkpoints store pending games and openings and can resume in plain text or the TUI. The ratings file is the source of truth: each finished game is applied to it once (the TUI also checkpoints after every game), never overwritten with a checkpoint snapshot. Tournament `--stockfish-path` is taken from the command line on resume, never from the checkpoint (a checkpoint must not choose an executable); restored player options are filtered to known keys.
 - **Repo**: deps aligned (`pyproject.toml`, `requirements.txt`), `.gitignore` for local agent tooling, docs refreshed, unbuilt-feature tests marked xfail/skip.
 
 ## Known gaps (found in review, not fixed)

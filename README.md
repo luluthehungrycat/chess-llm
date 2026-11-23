@@ -149,7 +149,7 @@ All games auto-save as PGN in `./games/` — load them in Lichess or Chess.com f
 | `--elo`, `--elo-db` | off, `ratings.json` | ELO tracking |
 | `--model-flags` | — | `key=val,...` applied to every LLM player |
 | `--resume [CHECKPOINT]` | off | Continue a saved tournament. Omit the path for `tournament_state.json`. |
-| `--stockfish-path` | auto | Path to the Stockfish binary. The checkpoint retains this path for resume. |
+| `--stockfish-path` | auto | Path to the Stockfish binary. Not restored from a checkpoint: pass it again with `--resume`. |
 | `--tui` / `--no-tui` | auto | Force or disable the Textual UI (auto = TUI when stdout is a terminal) |
 | `--log`, `-l` | off | Tee output to a log file |
 | `--retries`, `--temperature`, `--timeout`, `--no-tools`, `--tiny`, `--constrain`, `--reasoning` | as in `chess_llm.py` | Defaults applied to LLM players |

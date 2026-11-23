@@ -196,12 +196,15 @@ def test_plain_resume_without_players(monkeypatch, tmp_path, legacy):
         return "1/2-1/2"
 
     monkeypatch.setattr(tournament, "run_match", fake_match)
-    monkeypatch.setattr(sys, "argv", ["tournament.py", "--resume", path, "--no-tui"])
+    monkeypatch.setattr(sys, "argv", [
+        "tournament.py", "--resume", path, "--no-tui", "--stockfish-path", "/cli/stockfish",
+    ])
     tournament.main()
 
     [(white, black, kwargs)] = calls
     assert (white, black) == ("stockfish:0", "random")
-    assert kwargs["binary_path"] == "/custom/stockfish"
+    # The checkpoint's executable path is ignored; this run's flag is used.
+    assert kwargs["binary_path"] == "/cli/stockfish"
     if legacy:
         assert kwargs["starting_board"] is None
     else:
