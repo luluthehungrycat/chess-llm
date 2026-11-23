@@ -130,19 +130,48 @@ def _resolve_provider(model: str) -> tuple[str, str | None, str | None]:
     return model, None, None
 
 
-# ── Silence litellm's stderr spam once at module load ────────────────────────
-# litellm writes "Provider List: https://...", "Give Feedback / Get Help", etc.
-# to stderr on every error. We redirect stderr to /dev/null globally unless
-# LLM_CHESS_DEBUG=1 (or DEBUG_CHESS_LLM=1).
+# ── Quiet litellm's log spam (without touching sys.stderr) ───────────────────
+# litellm emits "Provider List: https://...", "Give Feedback / Get Help" and
+# cost-map warnings. Those are silenced via its logger levels here and
+# `litellm.suppress_debug_info` in _call_llm. We deliberately do NOT redirect
+# sys.stderr: that is process-wide and previously hid argparse errors,
+# tracebacks, and errors from parallel tournament threads.
 if not DEBUG:
     import logging
     logging.getLogger("litellm").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
-    # Redirect stderr to /dev/null for the lifetime of the process.
-    # The --log tee in main() replaces sys.stderr again after this,
-    # so stderr still ends up in the log file (just without litellm noise).
-    _litellm_devnull = open(os.devnull, "w")
-    sys.stderr = _litellm_devnull
+
+
+def _run_with_timeout(fn, limit: float, /, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a daemon thread; raise TimeoutError after
+    `limit` seconds. (Positional-only so callers can pass a `timeout=` kwarg
+    through to fn — litellm.completion takes one.)
+
+    Unlike `with ThreadPoolExecutor()`, this returns control immediately on
+    timeout (the executor's __exit__ would block until the hung call
+    finished). The thread is a daemon so a hung call cannot keep the process
+    alive at exit. Python cannot kill a thread, so a timed-out call keeps
+    running in the background until the provider gives up; its result is
+    discarded.
+    """
+    import threading
+
+    outcome: dict = {}
+
+    def _target():
+        try:
+            outcome["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # re-raised in the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True, name="llm-call")
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        raise TimeoutError(f"call did not finish within {limit}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 # ── LLM interface ────────────────────────────────────────────────────────────
 
@@ -232,17 +261,14 @@ def _call_llm(
         _apply_reasoning(kwargs, resolved_model, reasoning)
 
     # ── Hard timeout via thread (litellm's timeout is unreliable) ──────
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(litellm.completion, **kwargs)
-        try:
-            response = future.result(timeout=timeout + 15)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(
-                f"No response from {resolved_model} after {timeout + 15}s. "
-                f"Local model may be overloaded — try fewer parallel games "
-                f"or increase --timeout."
-            )
+    try:
+        response = _run_with_timeout(litellm.completion, timeout + 15, **kwargs)
+    except TimeoutError:
+        raise TimeoutError(
+            f"No response from {resolved_model} after {timeout + 15}s. "
+            f"Local model may be overloaded — try fewer parallel games "
+            f"or increase --timeout."
+        ) from None
     choice = response.choices[0].message
 
     result = {"content": choice.content or ""}
@@ -354,10 +380,33 @@ _SAN_TOKEN_RE = re.compile(
 
 def _extract_move(text: str, board: chess.Board) -> Optional[str]:
     """Extract a move (UCI or SAN) from free-text LLM output. Returns UCI string or None."""
-    # 1a. Try the explicit MOVE: marker (UCI format)
-    m = _MOVE_RE.search(text)
-    if m:
-        return m.group(1)
+    # 1a. Try the explicit MOVE: marker (UCI format). Prefer a legal marked
+    #     move; if the marked move is illegal, keep scanning (the model may
+    #     have corrected itself later) and only fall back to the illegal
+    #     marker at the end so the caller can explain why it was rejected.
+    marked_fallback = None
+    for m in _MOVE_RE.finditer(text):
+        uci = m.group(1).lower()
+        try:
+            if board.parse_uci(uci) in board.legal_moves:
+                return uci
+        except ValueError:
+            pass
+        if marked_fallback is None:
+            marked_fallback = uci
+            marked_end = m.end()
+
+    # 1a'. The marked move was illegal: a correction usually follows it, so
+    #      search only the text after the marker before scanning everything
+    #      (otherwise a move merely "considered" earlier wins).
+    if marked_fallback is not None:
+        later = _extract_move(text[marked_end:], board)
+        if later is not None:
+            try:
+                if board.parse_uci(later) in board.legal_moves:
+                    return later
+            except ValueError:
+                pass
 
     # 1b. Try "make_move d6" or "my move: Nf6" style
     m = _MOVE_CMD_RE.search(text)
@@ -403,7 +452,7 @@ def _extract_move(text: str, board: chess.Board) -> Optional[str]:
         except ValueError:
             continue
 
-    return None
+    return marked_fallback
 
 
 def _explain_illegal(board: chess.Board, move_str: str) -> str:
@@ -1014,9 +1063,13 @@ class StockfishPlayer:
         return result.move
 
     def close(self):
-        if self._engine:
-            self._engine.quit()
-            self._engine = None
+        engine, self._engine = self._engine, None
+        if engine:
+            try:
+                engine.quit()
+            except Exception:
+                engine.close()  # graceful quit failed: kill the transport
+                raise
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
@@ -1101,13 +1154,31 @@ class ChessMatch:
         return self.pgn_game.accept(exporter)
 
     def _cleanup(self):
-        """Close any engine-based players."""
+        """Close every engine-based player, even if an earlier close fails.
+
+        A close error is reported but never replaces the exception that
+        ended the match (that is the one the user needs to see).
+        """
         for p in (self.white, self.black):
             if hasattr(p, "close"):
-                p.close()
+                try:
+                    p.close()
+                except Exception as e:
+                    print(f"⚠ Failed to close {getattr(p, 'name', p)}: {e}", file=sys.stderr)
 
     def play(self) -> str:
-        """Play the game until conclusion. Returns result string ('1-0', '0-1', '1/2-1/2')."""
+        """Play the game until conclusion. Returns result string ('1-0', '0-1', '1/2-1/2').
+
+        Engine players are always closed, even if a player raises or the
+        user hits Ctrl-C — otherwise Stockfish processes leak, which
+        tournaments multiply across games.
+        """
+        try:
+            return self._play()
+        finally:
+            self._cleanup()
+
+    def _play(self) -> str:
         move_num = 0
 
         while not self.board.is_game_over(claim_draw=True):
@@ -1129,7 +1200,6 @@ class ChessMatch:
                 move = player.get_move(self.board, self._history_text())
             except IllegalMoveForfeit as e:
                 print(f"\n🏳 {e}")
-                self._cleanup()
                 if self.board.turn == chess.WHITE:
                     self.pgn_game.headers["Result"] = "0-1"
                     return "0-1"
@@ -1147,8 +1217,7 @@ class ChessMatch:
             if self.delay > 0:
                 time.sleep(self.delay)
 
-        # Game over
-        self._cleanup()
+        # Game over (engines are closed by play()'s finally)
         print(f"\n{'=' * 40}")
         print(render_board(self.board, self.board.move_stack[-1] if self.board.move_stack else None))
         result = self.board.result(claim_draw=True)
@@ -1187,11 +1256,42 @@ class ChessMatch:
         for p in (self.white, self.black):
             if hasattr(p, "illegal_count"):
                 print(f"   {p.name}: {p.illegal_count} illegal move(s)")
+        # is_capture() needs the position *before* each move, so replay the
+        # game from its root (which may be an opening FEN, not the start).
+        replay = self.board.root()
+        captures = 0
+        for move in self.board.move_stack:
+            captures += replay.is_capture(move)
+            replay.push(move)
+        print(f"   Moves: {len(self.board.move_stack)} plies, Captures: {captures}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
+# LLMPlayer kwargs that a player spec (models.yaml / ?query flags) may set.
+# Shared by parse_player, main()'s build_player and tournament.py so the
+# single-game and tournament paths can't drift apart again.
+LLM_PLAYER_KWARGS = (
+    "use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain",
+)
+
+
+def _parse_stockfish(spec: str, default_skill: int = 20) -> Optional[tuple[str, dict[str, Any]]]:
+    """'stockfish' / 'stockfish:N' / 'stockfish:' (→ default_skill), else None."""
+    m = re.match(r"^stockfish(?::(\d*))?$", spec.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    skill = int(m.group(1)) if m.group(1) else default_skill
+    return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
+
+
+def parse_player(
+    spec: str,
+    default_skill: int = 20,
+    *,
+    global_flags: dict | None = None,
+    per_player_flags: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     """
     Parse a player spec string into (type, kwargs) with model config support.
 
@@ -1205,23 +1305,18 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
       @preset-name          — Resolved from models.yaml
       provider/model        — LLMPlayer (with optional ?flags)
     """
-    from model_config import resolve_model_spec, ModelConfig
+    from model_config import resolve_model_spec, merge_llm_flags
 
     spec = spec.strip()
 
     # Check stockfish first (before model config resolution)
-    if spec.lower() == "stockfish":
-        return "stockfish", {"name": "Stockfish", "skill": 20}
-    m = re.match(r"^stockfish:(\d+)$", spec, re.IGNORECASE)
-    if m:
-        skill = int(m.group(1))
-        return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
+    sf = _parse_stockfish(spec, default_skill)
+    if sf:
+        return sf
 
-    # Resolve @preset-name or inline query flags via model_config
-    try:
-        resolved_model, inline_overrides = resolve_model_spec(spec)
-    except ValueError:
-        resolved_model, inline_overrides = spec, {}
+    # Resolve @preset-name or inline query flags via model_config.
+    # Unknown presets raise ValueError before a player is constructed.
+    resolved_model, inline_overrides = resolve_model_spec(spec)
 
     if resolved_model.lower() == "human":
         return "human", {"name": "Human"}
@@ -1232,24 +1327,14 @@ def parse_player(spec: str) -> tuple[str, dict[str, Any]]:
         return "random", {"name": "Random"}
 
     # Stockfish (resolved from preset, e.g. @stockfish-0 → stockfish:0)
-    if resolved_model.lower() == "stockfish":
-        return "stockfish", {"name": "Stockfish 20", "skill": 20}
-    m = re.match(r"^stockfish:(\d+)$", resolved_model, re.IGNORECASE)
-    if m:
-        skill = int(m.group(1))
-        return "stockfish", {"name": f"Stockfish {skill}", "skill": skill}
-
-    # LLM player — merge model_config defaults with inline overrides
-    cfg = ModelConfig.load()
-    merged_kwargs = {**cfg.get_defaults(), **inline_overrides}
-    if merged_kwargs.get("tiny"):
-        merged_kwargs["use_tools"] = False
+    sf = _parse_stockfish(resolved_model, default_skill)
+    if sf:
+        return sf
 
     return "llm", {
         "model": resolved_model,
-        "name": spec,  # preserve original spec as display name
-        **{k: v for k, v in merged_kwargs.items()
-           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning")},
+        "name": spec,
+        **merge_llm_flags(resolved_model, inline_overrides, global_flags, per_player_flags),
     }
 
 
@@ -1296,16 +1381,16 @@ def main():
         help="PGN output file (default: auto-generated in ./games/)",
     )
     parser.add_argument(
-        "--no-tools", action="store_true",
+        "--no-tools", action="store_true", default=None,
         help="Disable tool calling — use text parsing instead (for models that don't support tools)",
     )
     parser.add_argument(
-        "--tiny", action="store_true",
+        "--tiny", action="store_true", default=None,
         help="Tiny-model mode: compact UCI-only prompt for models <20B. "
              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.",
     )
     parser.add_argument(
-        "--constrain", action="store_true",
+        "--constrain", action="store_true", default=None,
         help="Force legal moves: when the model proposes an illegal move, "
              "pick the closest legal move instead of retrying or forfeiting. "
              "Use this for tiny/quantized models that can't learn from retry feedback.",
@@ -1317,7 +1402,7 @@ def main():
              "Use \"none\" to explicitly disable reasoning for supported models.",
     )
     parser.add_argument(
-        "--temperature", "-t", type=float, default=0.3,
+        "--temperature", "-t", type=float, default=None,
         help="LLM temperature (default: 0.3)",
     )
     parser.add_argument(
@@ -1331,11 +1416,11 @@ def main():
              "(e.g. tools=on,retries=3). Overrides global flags for black only.",
     )
     parser.add_argument(
-        "--retries", "-r", type=int, default=3,
+        "--retries", "-r", type=int, default=None,
         help="Max illegal-move retries before forfeit (default: 3)",
     )
     parser.add_argument(
-        "--timeout", type=int, default=120,
+        "--timeout", type=int, default=None,
         help="API timeout in seconds (default: 120, increase for slow local models)",
     )
     parser.add_argument(
@@ -1422,19 +1507,28 @@ def main():
     if args.model:
         args.white = args.black = args.model
 
-    # Build players
+    global_flags = dict(
+        use_tools=False if args.no_tools else None,
+        max_retries=args.retries,
+        temperature=args.temperature,
+        timeout=args.timeout,
+        tiny=args.tiny,
+        reasoning=args.reasoning,
+        constrain=args.constrain,
+    )
+
     def build_player(spec: str, color: str, per_player_flags: str | None = None):
-        ptype, kwargs = parse_player(spec)
-        # Parse per-player CLI flags: "tools=off,tiny=true,retries=10"
-        from model_config import _parse_query_flags
-        cli_overrides = _parse_query_flags(per_player_flags) if per_player_flags else {}
+        ptype, kwargs = parse_player(
+            spec, default_skill=args.stockfish_skill,
+            global_flags=global_flags, per_player_flags=per_player_flags,
+        )
         if ptype == "human":
             name = kwargs.get("name", "Human")
             return HumanPlayer(name=f"{name} ({color})")
         elif ptype == "random":
             return RandomPlayer(name=f"Random ({color})")
         elif ptype == "stockfish":
-            skill = kwargs.get("skill", args.stockfish_skill)
+            skill = kwargs["skill"]
             return StockfishPlayer(
                 name=f"Stockfish {skill} ({color})",
                 skill_level=skill,
@@ -1442,68 +1536,29 @@ def main():
                 threads=args.stockfish_threads,
                 binary_path=args.stockfish_path,
             )
-        else:
-            name = f"{kwargs['model']} ({color})"
-            # Merge: global CLI args → model_config defaults → preset → inline query → per-player flags
-            # Lower priority first, higher priority overwrites
-            effective_timeout = args.timeout
-            # Auto-bump timeout for verbose reasoning models
-            if kwargs["model"].startswith("bigpickle/") and effective_timeout == 120:
-                effective_timeout = 240
+        kwargs["name"] = f"{kwargs['model']} ({color})"
+        return LLMPlayer(api_base=args.api_base, api_key=args.api_key, **kwargs)
 
-            # Start with CLI global flags
-            merged: dict[str, Any] = dict(
-                use_tools=not args.no_tools and not args.tiny,
-                max_retries=args.retries,
-                temperature=args.temperature,
-                timeout=effective_timeout,
-                tiny=args.tiny,
-                reasoning=args.reasoning,
-                constrain=args.constrain,
-            )
-            # Overlay kwargs from parse_player (model_config defaults + preset + inline query)
-            for key in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain"):
-                if key in kwargs:
-                    merged[key] = kwargs[key]
-            # Per-player CLI flags win over everything
-            merged.update(cli_overrides)
-            # tiny forces no-tools
-            if merged.get("tiny"):
-                merged["use_tools"] = False
-
-            return LLMPlayer(
-                model=kwargs["model"],
-                name=name,
-                api_base=args.api_base,
-                api_key=args.api_key,
-                **merged,
-            )
-
-    white = build_player(args.white, "White", args.white_flags)
-    black = build_player(args.black, "Black", args.black_flags)
+    try:
+        white = build_player(args.white, "White", args.white_flags)
+        black = build_player(args.black, "Black", args.black_flags)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Pre-flight connectivity checks for LLM players
     for p in (white, black):
         if hasattr(p, "check_connectivity"):
             p.check_connectivity()
 
-    tools_label = "off" if args.no_tools or args.tiny else "on"
-    if args.tiny:
-        tools_label += " (tiny mode)"
-    # Detect auto-compact prompt for verbose reasoning models
-    # (big-pickle, deepseek-v4-flash-free, etc.)
-    _auto_compact = False
-    for p in (white, black):
-        if hasattr(p, "model") and p.model.startswith("bigpickle/"):
-            if ("big-pickle" in p.model or "deepseek" in p.model):
-                if not args.tiny and not args.no_tools:
-                    _auto_compact = True
-    prompt_style = "compact (reasoning model)" if _auto_compact else "full"
     print(f"\n♟  LLM Chess Match")
     print(f"   White: {white.name}")
     print(f"   Black: {black.name}")
-    print(f"   Delay: {args.delay}s  |  Retries: {args.retries}  |  "
-          f"Tools: {tools_label}  |  Prompt: {prompt_style}")
+    print(f"   Delay: {args.delay}s")
+    for player in (white, black):
+        if isinstance(player, LLMPlayer):
+            tools = "on" if player.use_tools else "off"
+            tiny = " (tiny mode)" if player.tiny else ""
+            print(f"   {player.name}: Retries: {player.max_retries}  |  Tools: {tools}{tiny}")
 
     match = ChessMatch(white, black, delay=args.delay)
     result = match.play()
@@ -1520,26 +1575,11 @@ def main():
 
     # ── ELO tracking ─────────────────────────────────────────────────
     if args.elo:
-        from elo import EloTracker
+        from elo import EloTracker, player_id
         tracker = EloTracker(args.elo_db)
 
-        def _elo_id(player) -> str:
-            """Extract a clean ELO ID from a player instance."""
-            if hasattr(player, "model"):
-                return player.model  # LLMPlayer: use the raw model string
-            if hasattr(player, "skill_level"):
-                return f"stockfish-{player.skill_level}"  # StockfishPlayer
-            name = player.name
-            # Strip color suffix: "mo (White)" → "mo"
-            if " (" in name:
-                name = name[: name.rindex(" (")] 
-            # Prefix human players to avoid collisions with model names
-            if name.lower() not in ("random",):
-                name = f"human-{name}"
-            return name
-
-        w_id = _elo_id(white)
-        b_id = _elo_id(black)
+        w_id = player_id(args.white, default_skill=args.stockfish_skill)
+        b_id = player_id(args.black, default_skill=args.stockfish_skill)
         w_old = tracker.get(w_id)["rating"]
         b_old = tracker.get(b_id)["rating"]
         updated = tracker.update(w_id, b_id, result)

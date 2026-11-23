@@ -22,81 +22,71 @@ import concurrent.futures
 import datetime
 import os
 import sys
-import threading
 import time
+from itertools import count
 from pathlib import Path
 from typing import Optional
 
 # Add parent to path so we can import chess_llm modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from elo import EloTracker
+from elo import EloTracker, player_id
+from chess_llm import ChessMatch
+from tui.state import STATE_FILE, build_schedule, clear_state, load_state, restore_schedule, save_state
 
 
-def parse_player_spec(spec: str):
-    """Parse a player spec string. Returns (player_type, player, label).
+class _LiveChessMatch(ChessMatch):
+    """Expose committed moves at the match's turn and completion boundaries."""
 
-    Handles @preset-name references and inline query flags from model_config.
-    Also resolves stockfish:skill and human:name syntax.
-    """
-    from model_config import resolve_model_spec, ModelConfig
-    from chess_llm import HumanPlayer, RandomPlayer, StockfishPlayer, LLMPlayer
+    def __init__(self, *args, on_move, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_move = on_move
+        self._reported_plies = len(self.board.move_stack)
 
-    # Resolve @preset and ?query=val before dispatching
-    try:
-        resolved_model, inline_overrides = resolve_model_spec(spec)
-    except ValueError:
-        resolved_model, inline_overrides = spec, {}
+    def _report_move(self):
+        plies = len(self.board.move_stack)
+        if plies > self._reported_plies:
+            self._reported_plies = plies
+            self._on_move(self.board, self.node.san(), self.board.peek())
 
-    if resolved_model.lower() == "human":
-        return "human", HumanPlayer(name="Human"), f"human-Human", {}
-    if resolved_model.startswith("human:"):
-        name = resolved_model.split(":", 1)[1].strip()
-        return "human", HumanPlayer(name=name), f"human-{name}", {}
-    if resolved_model.lower() == "random":
-        return "random", RandomPlayer(name="Random"), "random", {}
-    if resolved_model.lower() == "stockfish":
-        return "stockfish", StockfishPlayer(name="Stockfish 20", skill_level=20), "stockfish-20", {}
-    if resolved_model.startswith("stockfish:"):
-        skill_str = resolved_model.split(":", 1)[1].strip()
-        skill = int(skill_str) if skill_str else 20
-        name = f"Stockfish {skill}"
-        return "stockfish", StockfishPlayer(name=name, skill_level=skill), f"stockfish-{skill}", {}
+    def _history_text(self):
+        self._report_move()
+        return super()._history_text()
 
-    # LLM player — apply inline overrides from ?query string
-    cfg = ModelConfig.load()
-    # Merge: model_config defaults → inline overrides
-    merged_kwargs = {**cfg.get_defaults(), **inline_overrides}
-    # use_tools and tiny interact: tiny forces no-tools
-    if merged_kwargs.get("tiny"):
-        merged_kwargs["use_tools"] = False
+    def play(self):
+        result = super().play()
+        self._report_move()
+        return result
 
-    player = LLMPlayer(
-        model=resolved_model,
-        name=spec,  # preserve original spec as display name
-        **{k: v for k, v in merged_kwargs.items()
-           if k in ("use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning", "constrain")},
+
+def parse_player_spec(
+    spec: str, *, model_flags: str | None = None, binary_path: str | None = None,
+    think_time: float = 0.1, threads: int | None = None, **global_flags,
+):
+    """Return (player type, player, ELO ID, merged LLM options)."""
+    from chess_llm import (HumanPlayer, LLMPlayer, LLM_PLAYER_KWARGS, RandomPlayer,
+                           StockfishPlayer, parse_player)
+
+    ptype, kwargs = parse_player(
+        spec, global_flags=global_flags, per_player_flags=model_flags,
     )
-    return "llm", player, spec, merged_kwargs
+    elo_id = player_id(spec)
+    if ptype == "human":
+        return ptype, HumanPlayer(name=kwargs["name"]), elo_id, {}
+    if ptype == "random":
+        return ptype, RandomPlayer(name="Random"), elo_id, {}
+    if ptype == "stockfish":
+        player = StockfishPlayer(
+            name=kwargs["name"], skill_level=kwargs["skill"],
+            binary_path=binary_path, think_time=think_time, threads=threads,
+        )
+        return ptype, player, elo_id, {}
+    options = {k: v for k, v in kwargs.items() if k in LLM_PLAYER_KWARGS}
+    return ptype, LLMPlayer(**kwargs), elo_id, options
 
 
-def _elo_id_from_spec(spec: str) -> str:
-    """Extract the ELO key from a player spec WITHOUT creating a player instance."""
-    spec = spec.strip()
-    if spec.lower() == "random":
-        return "random"
-    if spec.lower() == "human":
-        return "human-Human"
-    if spec.startswith("human:"):
-        name = spec.split(":", 1)[1].strip()
-        return f"human-{name}"
-    if spec.lower() == "stockfish":
-        return "stockfish-20"
-    if spec.startswith("stockfish:"):
-        skill_str = spec.split(":", 1)[1].strip()
-        skill = int(skill_str) if skill_str else 20
-        return f"stockfish-{skill}"
-    return spec
+# Kept as a name for existing callers; the logic lives in elo.player_id.
+_elo_id_from_spec = player_id
 
 
 def run_match(white_spec: str, black_spec: str,
@@ -105,26 +95,12 @@ def run_match(white_spec: str, black_spec: str,
               log_dir: Optional[str] = None,
               starting_board = None,
               opening_name: str = "",
+              on_move=None,
+              quiet: bool = False,
               **player_kwargs) -> str:
     """Run a single match. Returns result string ('1-0', '0-1', '1/2-1/2')."""
-    from chess_llm import ChessMatch
-
-    _, white, w_id, white_overrides = parse_player_spec(white_spec)
-    _, black, b_id, black_overrides = parse_player_spec(black_spec)
-
-    # Merge: model_config defaults → preset → inline query → CLI kwargs
-    # Per-model overrides from config/query take priority over global CLI flags
-    for p, overrides in ((white, white_overrides), (black, black_overrides)):
-        for k, v in player_kwargs.items():
-            # Only set if we have a setter (skip if the override already covers it)
-            if hasattr(p, k) and k not in overrides:
-                if k == "timeout" and hasattr(p, "model") and getattr(p, "model", "").startswith("bigpickle/") and v == 120:
-                    v = 240
-                setattr(p, k, v)
-        # Now apply per-model overrides (these win over global flags)
-        for k, v in overrides.items():
-            if hasattr(p, k):
-                setattr(p, k, v)
+    _, white, w_id, _ = parse_player_spec(white_spec, **player_kwargs)
+    _, black, b_id, _ = parse_player_spec(black_spec, **player_kwargs)
 
     # Pre-flight
     for p in (white, black):
@@ -134,17 +110,18 @@ def run_match(white_spec: str, black_spec: str,
             except Exception as e:
                 print(f"   ⚠ {p.name}: connectivity check failed: {e}")
 
-    if starting_board is not None and opening_name:
+    if not quiet:
         print(f"\n{'=' * 50}")
         print(f"  {white.name} (White)  vs  {black.name} (Black)")
-        print(f"  Opening: {opening_name}")
-        print(f"{'=' * 50}")
-    else:
-        print(f"\n{'=' * 50}")
-        print(f"  {white.name} (White)  vs  {black.name} (Black)")
+        if starting_board is not None and opening_name:
+            print(f"  Opening: {opening_name}")
         print(f"{'=' * 50}")
 
-    match = ChessMatch(white, black, delay=delay, starting_board=starting_board)
+    if on_move is None:
+        match = ChessMatch(white, black, delay=delay, starting_board=starting_board)
+    else:
+        match = _LiveChessMatch(white, black, delay=delay, starting_board=starting_board,
+                                on_move=on_move)
     result = match.play()
 
     # Save PGN
@@ -153,8 +130,19 @@ def run_match(white_spec: str, black_spec: str,
     b_name = black.name.replace("/", "_").replace(" ", "_")[:40]
     games_dir = "games"
     os.makedirs(games_dir, exist_ok=True)
-    pgn_path = f"{games_dir}/{ts}_{w_name}_vs_{b_name}.pgn"
-    match.save_pgn(pgn_path)
+    stem = f"{ts}_{w_name}_vs_{b_name}"
+    for index in count():
+        suffix = f"_{index}" if index else ""
+        pgn_path = Path(games_dir) / f"{stem}{suffix}.pgn"
+        try:
+            pgn_file = pgn_path.open("x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        with pgn_file:
+            print(match.pgn_game, file=pgn_file)
+        break
+    if not quiet:
+        print(f"\n📄 PGN saved to {pgn_path}")
 
     # ELO
     if elo_tracker:
@@ -165,226 +153,129 @@ def run_match(white_spec: str, black_spec: str,
     return result
 
 
+def _run_schedule(
+    schedule, delay, elo_tracker, max_workers, player_kwargs,
+    *, sequential_pause=0, on_result=None,
+):
+    """Run scheduled games, applying ratings and progress on the main thread."""
+    started = time.monotonic()
+    results = []
+
+    def play(game, tracker=None):
+        try:
+            result = run_match(
+                game.white, game.black, delay=delay, elo_tracker=tracker,
+                starting_board=game.starting_board(), opening_name=game.opening_name,
+                **player_kwargs,
+            )
+            return result, None
+        except Exception as exc:
+            return "error", str(exc)
+
+    def collect(index, outcome):
+        game = schedule[index]
+        result, error = outcome
+        results.append((game.white, game.black, result))
+        if error is not None:
+            print(f"  ❌ Match failed: {error}")
+        if on_result is not None:
+            on_result(index, result)
+
+    if max_workers <= 1:
+        for index, game in enumerate(schedule):
+            print(f"\n── Game {index + 1}/{len(schedule)}: {game.white} vs {game.black} ──")
+            collect(index, play(game, elo_tracker))
+            if sequential_pause:
+                time.sleep(sequential_pause)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(play, game): i for i, game in enumerate(schedule)}
+            for future in concurrent.futures.as_completed(futures):
+                collect(futures[future], future.result())
+                white, black, result = results[-1]
+                print(f"  ⚡ [{len(results)}/{len(schedule)}] {white} vs {black} → {result}")
+
+        if elo_tracker:
+            for white, black, result in results:
+                if result != "error":
+                    elo_tracker.update(_elo_id_from_spec(white), _elo_id_from_spec(black), result)
+
+    print(f"\n  Tournament finished in {time.monotonic() - started:.0f}s")
+    print(f"  Games: {len(results)}")
+    if elo_tracker:
+        elo_tracker.print_leaderboard()
+    return results
+
+
 def round_robin(models: list[str], games_per_pair: int = 1,
                 delay: float = 0.5, elo_tracker: Optional[EloTracker] = None,
                 max_workers: int = 1, openings_mode: str = "standard",
                 **player_kwargs):
-    """Run a round-robin tournament (each model plays every other as both colors).
-
-    When max_workers > 1, games run in parallel via ThreadPoolExecutor.
-    ELO updates are batched after all games complete to avoid file corruption.
-    openings_mode: 'standard' (default) or 'unbalanced' (forces decisive games).
-    """
-    total_games = len(models) * (len(models) - 1) * games_per_pair
-    print(f"\n🏟  Round-Robin Tournament: {len(models)} players")
-    print(f"   Models: {', '.join(models)}")
-    print(f"   Games per pair: {games_per_pair}")
-    print(f"   Total games: {total_games}")
-    if openings_mode == "unbalanced":
-        from openings import OPENINGS
-        print(f"   Openings: unbalanced ({len(OPENINGS)} lines, alternating advantage)")
-    if max_workers > 1:
-        print(f"   Parallel workers: {max_workers}  |  ELO: batch-at-end")
-
-    # Lazy-load openings module
-    _openings_uci = None
-
-    def _get_starting_board(opening_idx: int):
-        """Return (board, opening_name) for the given opening index, or (None, '')."""
-        nonlocal _openings_uci
-        if openings_mode != "unbalanced":
-            return None, ""
-        if _openings_uci is None:
-            from openings import OPENINGS
-            _openings_uci = OPENINGS
-        import chess
-        name, moves, advantage = _openings_uci[opening_idx % len(_openings_uci)]
-        board = chess.Board()
-        for uci in moves:
-            board.push_uci(uci)
-        return board, name
-
-    results = []
-    start_time = time.time()
-
-    # ── Build task list ───────────────────────────────────────────────
-    tasks = []
-    opening_counter = 0
-    for i, white_model in enumerate(models):
-        for j, black_model in enumerate(models):
-            if i == j:
-                continue
-            for g in range(games_per_pair):
-                tasks.append((white_model, black_model, g, opening_counter))
-                opening_counter += 1
-
-    # ── Sequential mode ───────────────────────────────────────────────
-    if max_workers <= 1:
-        for white_model, black_model, g, oi in tasks:
-            board, oname = _get_starting_board(oi)
-            print(f"\n── Round: {white_model} vs {black_model} "
-                  f"(game {g + 1}/{games_per_pair}) ──")
-            try:
-                result = run_match(
-                    white_model, black_model,
-                    delay=delay, elo_tracker=elo_tracker,
-                    starting_board=board, opening_name=oname,
-                    **player_kwargs,
-                )
-                results.append((white_model, black_model, result))
-            except Exception as e:
-                print(f"  ❌ Match failed: {e}")
-                results.append((white_model, black_model, "error"))
-            time.sleep(0.5)
-
-    # ── Parallel mode ─────────────────────────────────────────────────
-    else:
-        completed = 0
-        failed = 0
-        _lock = threading.Lock()
-
-        def _run_one(task):
-            white_model, black_model, g, oi = task
-            board, oname = _get_starting_board(oi)
-            try:
-                result = run_match(
-                    white_model, black_model,
-                    delay=delay, elo_tracker=None,
-                    starting_board=board, opening_name=oname,
-                    **player_kwargs,
-                )
-                return (white_model, black_model, result, None)
-            except Exception as e:
-                return (white_model, black_model, "error", str(e))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_run_one, t): t for t in tasks}
-            for future in concurrent.futures.as_completed(futures):
-                white_model, black_model, result, error = future.result()
-                with _lock:
-                    completed += 1
-                    if error:
-                        failed += 1
-                    results.append((white_model, black_model, result))
-                    pct = completed * 100 // len(tasks)
-                    status = f"  ⚡ [{completed}/{len(tasks)}] {pct}%  "
-                    if failed:
-                        status += f"({failed} failed)  "
-                    status += f"{white_model} vs {black_model} → {result}"
-                    print(status)
-
-        # ── Batch ELO update ──────────────────────────────────────────
-        if elo_tracker:
-            print(f"\n📊 Computing ELO ratings...")
-            for white_model, black_model, result in results:
-                if result == "error":
-                    continue
-                w_id = _elo_id_from_spec(white_model)
-                b_id = _elo_id_from_spec(black_model)
-                elo_tracker.update(w_id, b_id, result)
-            elo_tracker.print_leaderboard()
-            return results
-
-    elapsed = time.time() - start_time
-    print(f"\n{'=' * 50}")
-    print(f"  Tournament complete in {elapsed:.0f}s")
-    print(f"  Games: {len(results)}")
-    if elo_tracker and max_workers <= 1:
-        elo_tracker.print_leaderboard()
-    return results
+    """Play each pair in both colours."""
+    print(f"\n🏟  Round-Robin Tournament: {', '.join(models)}")
+    schedule = build_schedule(models, games_per_pair, openings_mode)
+    return _run_schedule(
+        schedule, delay, elo_tracker, max_workers, player_kwargs, sequential_pause=0.5,
+    )
 
 
 def gauntlet(champion: str, opponents: list[str],
              games_per_opponent: int = 1, delay: float = 0.5,
              elo_tracker: Optional[EloTracker] = None,
-             max_workers: int = 1, **player_kwargs):
-    """Gauntlet: champion plays each opponent (both colors).
+             max_workers: int = 1, openings_mode: str = "standard", **player_kwargs):
+    """Play the champion against each opponent, alternating colours."""
+    print(f"\n🏟  Gauntlet: {champion} vs {', '.join(opponents)}")
+    schedule = build_schedule(
+        [champion, *opponents], games_per_opponent, openings_mode, gauntlet=True,
+    )
+    return _run_schedule(schedule, delay, elo_tracker, max_workers, player_kwargs)
 
-    When max_workers > 1, games run in parallel via ThreadPoolExecutor.
-    ELO updates are batched after all games complete.
-    """
-    total_games = len(opponents) * games_per_opponent * 2
-    print(f"\n🏟  Gauntlet: {champion} vs the field")
-    print(f"   Opponents: {', '.join(opponents)}")
-    print(f"   Games per opponent: {games_per_opponent * 2} (both colors)")
-    if max_workers > 1:
-        print(f"   Parallel workers: {max_workers}  |  ELO: batch-at-end")
 
-    results = []
-    start_time = time.time()
-
-    # ── Build task list ───────────────────────────────────────────────
-    tasks = []
-    for opponent in opponents:
-        for g in range(games_per_opponent):
-            tasks.append((champion, opponent, g, "W"))   # champion as white
-            tasks.append((opponent, champion, g, "B"))   # champion as black
-
-    # ── Sequential mode ───────────────────────────────────────────────
-    if max_workers <= 1:
-        for white_model, black_model, g, _ in tasks:
-            print(f"\n── Gauntlet: {white_model} (W) vs {black_model} (B) "
-                  f"(game {g + 1}) ──")
-            try:
-                result = run_match(white_model, black_model, delay=delay,
-                                   elo_tracker=elo_tracker, **player_kwargs)
-                results.append((white_model, black_model, result))
-            except Exception as e:
-                print(f"  ❌ Match failed: {e}")
-                results.append((white_model, black_model, "error"))
-
-    # ── Parallel mode ─────────────────────────────────────────────────
+def _resume_plain(state, config, schedule, path):
+    """Resume a checkpoint using its ratings snapshot and pending games."""
+    completed = [tuple(game) for game in state["completed"] if game[2] != "error"]
+    elo_db = config.get("elo_db_path")
+    # The live ratings file is the source of truth: each new game is applied
+    # to it as it finishes. Overwriting it with the checkpoint snapshot would
+    # erase ratings recorded since the checkpoint was written.
+    if elo_db:
+        tracker = EloTracker(elo_db)
     else:
-        completed = 0
-        failed = 0
-        _lock = threading.Lock()
+        tracker = EloTracker(":memory:")
+        tracker._ratings = state.get("elo_ratings", {})
+    finished = set()
 
-        def _run_one(task):
-            white_model, black_model, g, _ = task
-            try:
-                result = run_match(
-                    white_model, black_model,
-                    delay=delay, elo_tracker=None,
-                    **player_kwargs,
-                )
-                return (white_model, black_model, result, None)
-            except Exception as e:
-                return (white_model, black_model, "error", str(e))
+    def record(index, result):
+        if result == "error":
+            return
+        game = schedule[index]
+        tracker.update(player_id(game.white), player_id(game.black), result)
+        finished.add(index)
+        completed.append((game.white, game.black, result))
+        save_state(
+            config["models"], config["games_per_pair"], config["delay"],
+            config["max_workers"], config["player_kwargs"], completed,
+            tracker._ratings, elo_db, state["started_at"],
+            openings_mode=config.get("openings_mode", "standard"),
+            remaining_games=[game for i, game in enumerate(schedule) if i not in finished],
+            path=path,
+        )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_run_one, t): t for t in tasks}
-            for future in concurrent.futures.as_completed(futures):
-                white_model, black_model, result, error = future.result()
-                with _lock:
-                    completed += 1
-                    if error:
-                        failed += 1
-                    results.append((white_model, black_model, result))
-                    pct = completed * 100 // len(tasks)
-                    status = f"  ⚡ [{completed}/{len(tasks)}] {pct}%  "
-                    if failed:
-                        status += f"({failed} failed)  "
-                    status += f"{white_model} vs {black_model} → {result}"
-                    print(status)
-
-        # ── Batch ELO update ──────────────────────────────────────────
-        if elo_tracker:
-            print(f"\n📊 Computing ELO ratings...")
-            for white_model, black_model, result in results:
-                if result == "error":
-                    continue
-                w_id = _elo_id_from_spec(white_model)
-                b_id = _elo_id_from_spec(black_model)
-                elo_tracker.update(w_id, b_id, result)
-            elo_tracker.print_leaderboard()
-            return results
-
-    elapsed = time.time() - start_time
-    print(f"\n{'=' * 50}")
-    print(f"  Gauntlet complete in {elapsed:.0f}s")
-    if elo_tracker and max_workers <= 1:
-        elo_tracker.print_leaderboard()
+    results = _run_schedule(
+        schedule, config["delay"], None, config["max_workers"],
+        config["player_kwargs"], on_result=record,
+    )
+    if elo_db:
+        tracker.print_leaderboard()
+    if len(finished) == len(schedule):
+        clear_state(path)
     return results
+
+
+_RESUMABLE_PLAYER_KWARGS = frozenset({
+    "use_tools", "max_retries", "temperature", "timeout", "tiny", "reasoning",
+    "constrain", "model_flags", "threads", "think_time",
+})
 
 
 def main():
@@ -402,7 +293,7 @@ def main():
                "      --opponents bigpickle/deepseek-v4-flash-free stockfish:0 --elo --delay 0",
     )
 
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--round-robin", nargs="+", metavar="MODEL",
                       help="Round-robin: every model plays every other (both colors)")
     mode.add_argument("--gauntlet", metavar="CHAMPION",
@@ -425,12 +316,12 @@ def main():
     parser.add_argument("--elo", action="store_true",
                         help="Track ELO ratings")
     parser.add_argument("--elo-db", default="ratings.json")
-    parser.add_argument("--no-tools", action="store_true",
+    parser.add_argument("--no-tools", action="store_true", default=None,
                         help="Disable tool calling for LLM players")
-    parser.add_argument("--tiny", action="store_true",
+    parser.add_argument("--tiny", action="store_true", default=None,
                         help="Tiny-model mode: compact UCI-only prompt for models <20B. "
                              "Forces --no-tools, strips FEN, uses strict MOVE: <uci> format.")
-    parser.add_argument("--constrain", action="store_true",
+    parser.add_argument("--constrain", action="store_true", default=None,
                         help="Force legal moves: when the model proposes an illegal move, "
                              "pick the closest legal move instead of retrying or forfeiting.")
     parser.add_argument("--reasoning", choices=["low", "medium", "high", "none"],
@@ -438,15 +329,17 @@ def main():
                         help="Reasoning effort for providers that support it "
                              "(OpenRouter/OpenAI: reasoning_effort; Anthropic: thinking budget). "
                              "Use \"none\" to skip reasoning. Omit for provider default.")
-    parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--temperature", type=float, default=0.3)
-    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--retries", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--model-flags", type=str, default=None,
                         help="Comma-separated key=val flags applied to ALL LLM players "
                              "(e.g. tools=off,tiny=true,retries=10). "
-                             "Per-model config from models.yaml takes priority.")
+                             "Overrides global flags and model settings.")
     parser.add_argument("--stockfish-skill", type=int, default=20)
     parser.add_argument("--stockfish-time", type=float, default=0.1)
+    parser.add_argument("--stockfish-path",
+                        help="Path to stockfish binary (default: auto-detect from PATH or common locations)")
     parser.add_argument(
         "--stockfish-threads", type=int, default=None,
         help="Number of CPU threads for Stockfish (default: use all cores). "
@@ -461,12 +354,16 @@ def main():
                            help="Force plain text mode (no dashboard)")
 
     # ── Resume / log ──────────────────────────────────────────────────
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume a saved tournament from tournament_state.json")
+    parser.add_argument("--resume", nargs="?", const=STATE_FILE, metavar="CHECKPOINT",
+                        help=f"Resume a saved tournament (default checkpoint: {STATE_FILE})")
     parser.add_argument("--log", "-l", nargs="?", const="auto", default=None,
                         help="Tee output to a log file (auto-names by date; or give a path)")
 
     args = parser.parse_args()
+    if not (args.resume or args.round_robin or args.gauntlet):
+        parser.error("provide --round-robin, --gauntlet, or --resume")
+    if not args.resume and args.gauntlet and not args.opponents:
+        parser.error("--gauntlet requires --opponents")
 
     # ── Log file tee (for non-TUI mode) ───────────────────────────────
     if args.log and not sys.stdout.isatty():
@@ -489,121 +386,115 @@ def main():
         sys.stdout = _Tee()
         print(f"📝 Logging to {args.log}")
 
+    # ── Normalise and validate player specs up front ──────────────────
+    # Bare "stockfish" takes --stockfish-skill; rewriting the spec keeps the
+    # player, its label and its ELO id in agreement everywhere downstream.
+    def _normalise(spec: str) -> str:
+        if spec.strip().lower() in ("stockfish", "stockfish:"):
+            return f"stockfish:{args.stockfish_skill}"
+        return spec
+
+    if args.round_robin:
+        args.round_robin = [_normalise(s) for s in args.round_robin]
+    if args.gauntlet:
+        args.gauntlet = _normalise(args.gauntlet)
+    if args.opponents:
+        args.opponents = [_normalise(s) for s in args.opponents]
+
+    from chess_llm import parse_player
+    for spec in (args.round_robin or []) + [args.gauntlet] * bool(args.gauntlet) + (args.opponents or []):
+        try:
+            parse_player(spec)
+        except ValueError as e:
+            parser.error(str(e))
+
     # Auto-detect TUI: use when stdout is a terminal unless explicitly disabled
     use_tui = args.tui if args.tui is not None else (
         sys.stdout.isatty() and args.no_tui is not True
     )
 
-    # ── TUI path ──────────────────────────────────────────────────────
+    if args.resume:
+        try:
+            state = load_state(args.resume)
+            if state is None:
+                parser.error(f"checkpoint not found: {args.resume}")
+            config = state["config"]
+            config.setdefault("openings_mode", "standard")
+            # A checkpoint is data, not a command line: keep only known
+            # player options, and never take an executable path from it.
+            # The engine binary comes from this run's --stockfish-path.
+            kwargs = config.get("player_kwargs") or {}
+            config["player_kwargs"] = {
+                k: v for k, v in kwargs.items() if k in _RESUMABLE_PLAYER_KWARGS
+            }
+            config["player_kwargs"]["binary_path"] = args.stockfish_path
+            schedule = restore_schedule(state)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            parser.error(f"could not load checkpoint {args.resume}: {exc}")
+        print(f"📂 Resuming tournament: {len(schedule)} games remaining")
+    else:
+        state = None
+        config = dict(
+            models=args.round_robin or [args.gauntlet, *args.opponents],
+            games_per_pair=args.games,
+            delay=args.delay,
+            max_workers=max(args.parallel, 1),
+            openings_mode=args.openings,
+            elo_db_path=args.elo_db if args.elo else None,
+            player_kwargs=dict(
+                use_tools=False if args.no_tools else None,
+                max_retries=args.retries,
+                temperature=args.temperature,
+                timeout=args.timeout,
+                tiny=args.tiny,
+                reasoning=args.reasoning,
+                constrain=args.constrain,
+                model_flags=args.model_flags,
+                threads=args.stockfish_threads,
+                think_time=args.stockfish_time,
+                binary_path=args.stockfish_path,
+            ),
+        )
+
     if use_tui:
         try:
             from tui.tournament import TournamentApp
-            from tui.state import load_state
 
-            # Resume from saved state
-            resume_completed = None
-            resume_elo = None
-
-            if args.resume:
-                state = load_state()
-                if state is None:
-                    print("❌ No saved tournament state found (tournament_state.json missing)")
-                    sys.exit(1)
-                cfg = state["config"]
-                models = cfg["models"]
-                games_per_pair = cfg["games_per_pair"]
-                delay = cfg["delay"]
-                workers = cfg["max_workers"]
-                player_kwargs = cfg["player_kwargs"]
-                elo_db = cfg.get("elo_db_path")
-                resume_completed = [tuple(r) for r in state["completed"]]
-                resume_elo = state.get("elo_ratings", {})
-                print(f"📂 Resuming tournament: {len(resume_completed)} games already completed, "
-                      f"{len(models)} players")
-            else:
-                models = args.round_robin if args.round_robin else (
-                    [args.gauntlet] + (args.opponents or [])
+            if state is None:
+                schedule = build_schedule(
+                    config["models"], args.games, args.openings, gauntlet=bool(args.gauntlet),
                 )
-                games_per_pair = args.games
-                delay = args.delay
-                workers = max(args.parallel, 1)
-                player_kwargs = dict(
-                    use_tools=not args.no_tools,
-                    max_retries=args.retries,
-                    temperature=args.temperature,
-                    timeout=args.timeout,
-                    threads=args.stockfish_threads,
-                    think_time=args.stockfish_time,
-                    tiny=args.tiny,
-                    reasoning=args.reasoning,
-                    constrain=args.constrain,
-                )
-                # Merge --model-flags (applied to all models, but per-model config wins)
-                if args.model_flags:
-                    from model_config import _parse_query_flags
-                    player_kwargs.update(_parse_query_flags(args.model_flags))
-                elo_db = args.elo_db if args.elo else None
-
             app = TournamentApp(
-                models=models,
-                games_per_pair=games_per_pair,
-                delay=delay,
-                elo_db_path=elo_db,
-                player_kwargs=player_kwargs,
-                max_workers=workers,
-                resume_completed=resume_completed,
-                resume_elo=resume_elo,
-                openings_mode=args.openings if not args.resume else resume_elo.get("openings_mode", "standard"),
+                **config,
+                schedule=schedule,
+                resume_completed=[tuple(game) for game in state["completed"]] if state else None,
+                resume_elo=state.get("elo_ratings", {}) if state else None,
+                checkpoint_path=args.resume or STATE_FILE,
             )
             app.run()
             return
         except Exception as e:
+            if args.tui:
+                raise
             print(f"⚠ TUI failed to start: {e}", file=sys.stderr)
             print("Falling back to plain-text mode. Use --no-tui to skip this warning.", file=sys.stderr)
-            # Fall through to non-TUI path below
 
-    # ELO tracker
+    if state is not None:
+        _resume_plain(state, config, schedule, args.resume)
+        return
+
     elo_tracker = EloTracker(args.elo_db) if args.elo else None
-
-    player_kwargs = dict(
-        use_tools=not args.no_tools,
-        max_retries=args.retries,
-        temperature=args.temperature,
-        timeout=args.timeout,
-        threads=args.stockfish_threads,
-        think_time=args.stockfish_time,
-        tiny=args.tiny,
-        reasoning=args.reasoning,
-        constrain=args.constrain,
+    options = dict(
+        delay=config["delay"],
+        elo_tracker=elo_tracker,
+        max_workers=config["max_workers"],
+        openings_mode=config["openings_mode"],
+        **config["player_kwargs"],
     )
-    # Merge --model-flags (applied to all models, but per-model config wins)
-    if args.model_flags:
-        from model_config import _parse_query_flags
-        player_kwargs.update(_parse_query_flags(args.model_flags))
-
     if args.round_robin:
-        round_robin(
-            args.round_robin,
-            games_per_pair=args.games,
-            delay=args.delay,
-            elo_tracker=elo_tracker,
-            max_workers=args.parallel,
-            openings_mode=args.openings,
-            **player_kwargs,
-        )
-    elif args.gauntlet:
-        if not args.opponents:
-            print("❌ --gauntlet requires --opponents")
-            sys.exit(1)
-        gauntlet(
-            args.gauntlet,
-            args.opponents,
-            games_per_opponent=args.games,
-            delay=args.delay,
-            elo_tracker=elo_tracker,
-            max_workers=args.parallel,
-            **player_kwargs,
-        )
+        round_robin(args.round_robin, games_per_pair=args.games, **options)
+    else:
+        gauntlet(args.gauntlet, args.opponents, games_per_opponent=args.games, **options)
 
 
 if __name__ == "__main__":

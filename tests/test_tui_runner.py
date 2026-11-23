@@ -41,7 +41,7 @@ class TestEloId:
         ("stockfish", "stockfish-20"),
         ("stockfish:0", "stockfish-0"),
         ("stockfish-15", "stockfish-15"),
-        ("@qwen3-local", "@qwen3-local"),  # passthrough
+        ("@qwen3-local", "llama-cpp/Qwen3-30B-A3B-Instruct-2507-IQ3_S-3.02bpw"),
         ("bigpickle/big-pickle", "bigpickle/big-pickle"),
     ])
     def test_id_extraction(self, spec, expected):
@@ -177,3 +177,36 @@ class TestEloView:
         durations = {"a": [2.0, 3.0, 1.0]}
         text = render_matchup_summary(completed, fresh_tracker, durations, top_n=10)
         assert "2s/game" in text  # avg = 2.0s, format "~2s/game"
+
+
+
+def test_checkpoint_keeps_exact_pending_openings(monkeypatch, tmp_path):
+    import tournament
+    from tui.state import build_schedule, load_state, restore_schedule, save_state
+
+    games = build_schedule(["a", "b"], 2, "unbalanced")
+    first = games[0]
+
+    def fake_match(white, black, *, opening_name, **kwargs):
+        if opening_name == first.opening_name:
+            raise RuntimeError("game failed")
+        return "1-0"
+
+    monkeypatch.setattr(tournament, "run_match", fake_match)
+    runner = TournamentRunner(
+        ["a", "b"], 2, 0, 2, {}, EloTracker(":memory:"),
+        openings_mode="unbalanced", schedule=games,
+    )
+    runner.start()
+    runner.process_results()
+    assert len(runner.completed) == 3
+
+    path = str(tmp_path / "checkpoint.json")
+    save_state(
+        runner.models, 2, 0, 2, {}, runner.completed, {}, None, 0,
+        openings_mode=runner.openings_mode, remaining_games=runner.remaining_games(),
+        path=path,
+    )
+    state = load_state(path)
+    assert state["config"]["openings_mode"] == "unbalanced"
+    assert restore_schedule(state) == [first]

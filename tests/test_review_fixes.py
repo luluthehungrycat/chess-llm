@@ -1,5 +1,7 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import chess
@@ -58,6 +60,28 @@ def test_failed_resume_tasks_are_retried():
     ]
 
 
+def test_parallel_matches_keep_all_pgns(tmp_path, monkeypatch):
+    from tournament import run_match
+
+    monkeypatch.chdir(tmp_path)
+    games = tmp_path / "games"
+    games.mkdir()
+    existing = games / "20260101_000000_Random_vs_Random.pgn"
+    existing.write_text("existing game")
+
+    with patch("tournament.datetime.datetime") as clock, patch.object(
+        ChessMatch, "play", return_value="1/2-1/2"
+    ), ThreadPoolExecutor(max_workers=2) as executor:
+        clock.now.return_value = datetime(2026, 1, 1)
+        matches = [executor.submit(run_match, "random", "random") for _ in range(2)]
+        assert all(match.result() == "1/2-1/2" for match in matches)
+
+    assert existing.read_text() == "existing game"
+    new_games = set(games.glob("*.pgn")) - {existing}
+    assert len(new_games) == 2
+    assert all('[White "Random"]' in game.read_text() for game in new_games)
+
+
 def test_live_state_uses_update_sequence(tmp_path):
     tracker = EloTracker(":memory:")
     runner = TournamentRunner(["a", "b"], 1, 0, 1, {}, tracker)
@@ -65,9 +89,11 @@ def test_live_state_uses_update_sequence(tmp_path):
     second = chess.Board()
     with runner._lock:
         runner._live_sequence = 2
-        runner._live_state[1] = (first, "e4", "a", "b", 1, "White", 1)
-        runner._live_state[2] = (second, "d5", "b", "a", 1, "Black", 2)
-    assert runner.latest_live_state()[1] == "d5"
+        # Inserted first but updated most recently: sequence, not insertion
+        # order, must decide which board is shown.
+        runner._live_state[1] = (first, "e4", "a", "b", 1, "White", 2)
+        runner._live_state[2] = (second, "d5", "b", "a", 1, "Black", 1)
+    assert runner.latest_live_state()[1] == "e4"
 
 
 def test_error_results_are_not_completed(tmp_path):

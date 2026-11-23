@@ -1,13 +1,14 @@
 """
 Per-model configuration for chess-llm.
 
-Supports three sources of model-specific settings, merged in priority order
+Supports these sources of model-specific settings, merged in priority order
 (later overrides earlier):
 
   1. defaults in models.yaml
   2. named presets in models.yaml (referenced as @preset-name)
   3. inline query flags on the model string (model?key=val&key=val)
-  4. CLI per-player flags (--white-flags, --black-flags, --player-flags)
+  4. Explicit global CLI flags
+  5. CLI per-player flags (--white-flags, --black-flags, --model-flags)
 
 Usage:
     from model_config import ModelConfig, resolve_model_spec
@@ -44,10 +45,6 @@ FLAG_MAP = {
     "timeout":       "timeout",
     "reasoning":     "reasoning",
 }
-
-# Boolean flags that accept "on"/"off"/"true"/"false"/"1"/"0"
-_BOOL_FLAGS = {"use_tools", "tools", "tiny"}
-
 
 def _coerce_bool(value: Any) -> Any:
     """Convert human-friendly bool strings to Python bool."""
@@ -92,7 +89,8 @@ def _parse_query_flags(query_string: str) -> dict[str, Any]:
             continue
 
         mapped = FLAG_MAP[key]
-        val = _coerce_bool(val)
+        if mapped in ("use_tools", "tiny", "constrain"):
+            val = _coerce_bool(val)
 
         # Cast numeric strings
         if isinstance(val, str) and mapped in ("temperature", "timeout", "max_retries"):
@@ -144,7 +142,7 @@ def resolve_model_spec(spec: str) -> tuple[str, dict[str, Any]]:
                 f"Known presets: {', '.join(cfg.list_presets()) or '(none)'}"
             )
         model = preset.get("model", "")
-        overrides = {k: v for k, v in preset.items() if k != "model" and k in FLAG_MAP.values()}
+        overrides = {FLAG_MAP[k]: _coerce_bool(v) for k, v in preset.items() if k in FLAG_MAP}
         # Merge inline query flags on top
         query = m.group("query") or ""
         overrides.update(_parse_query_flags(query))
@@ -205,3 +203,26 @@ class ModelConfig:
     def list_presets(self) -> list[str]:
         """Return sorted list of preset names."""
         return sorted(self._presets.keys())
+
+
+def merge_llm_flags(
+    model: str,
+    spec_flags: dict,
+    global_flags: dict | None = None,
+    per_player_flags: str | None = None,
+) -> dict:
+    """Merge CLI and model settings before applying constructor invariants."""
+    overrides = {
+        **spec_flags,
+        **{key: value for key, value in (global_flags or {}).items()
+           if key in FLAG_MAP.values() and value is not None},
+        **_parse_query_flags(per_player_flags or ""),
+    }
+    defaults = ModelConfig.load().get_defaults()
+    merged = {**defaults, **overrides}
+    if model.startswith("bigpickle/") and "timeout" not in overrides:
+        if merged.get("timeout", 120) == 120:
+            merged["timeout"] = 240
+    if merged.get("tiny"):
+        merged["use_tools"] = False
+    return merged

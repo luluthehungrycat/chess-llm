@@ -1,46 +1,23 @@
 """Tournament TUI dashboard for LLM Chess."""
 
-import queue
-import threading
 import time
 from typing import Optional
 
-from rich.table import Table
+import chess
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, Horizontal
 from textual.widgets import (
     Header, Footer, Static, ProgressBar, DataTable, RichLog,
-    Label, Button,
+    Label,
 )
-from textual.reactive import reactive
 from textual import work
 
 from elo import EloTracker
-from .common import (
-    TUI_CSS, BG, SURFACE, ACCENT, HIGHLIGHT,
-    TEXT_PRIMARY, TEXT_SECONDARY, SUCCESS, WARNING, ERROR, DRAW_COLOR,
-)
-from .state import save_state, clear_state, compute_remaining_tasks
-
-
-# ── Lightweight ELO key extractor (no player creation) ──────────────────
-def _elo_id(spec: str) -> str:
-    spec = spec.strip()
-    if spec.lower() == "random":
-        return "random"
-    if spec.lower() == "human":
-        return "human-Human"
-    if spec.startswith("human:"):
-        name = spec.split(":", 1)[1].strip()
-        return f"human-{name}"
-    if spec.lower() == "stockfish":
-        return "stockfish-20"
-    if spec.startswith("stockfish:"):
-        skill_str = spec.split(":", 1)[1].strip()
-        skill = int(skill_str) if skill_str else 20
-        return f"stockfish-{skill}"
-    return spec
+from .board import BoardWidget
+from .common import TUI_CSS
+from .runner import TournamentRunner, _elo_id
+from .state import STATE_FILE, ScheduledGame, save_state, clear_state
 
 
 class ELOComputer:
@@ -65,7 +42,9 @@ class ELOComputer:
             return len(data)
         return 0
 
-    def add_game(self, white_id: str, black_id: str, result: str):
+    def update(self, white_id: str, black_id: str, result: str):
+        if white_id == black_id:
+            return  # self-play is unrated (matches elo.EloTracker)
         w = self._get(white_id)
         b = self._get(black_id)
 
@@ -107,11 +86,16 @@ class ELOComputer:
 class TournamentApp(App):
     """Textual TUI for tournament dashboard."""
 
-    CSS = TUI_CSS
+    CSS = TUI_CSS + """
+    #dashboard { height: auto; }
+    #board-panel { width: 29; height: auto; }
+    #worker-log { height: 1fr; }
+    """
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("p", "toggle_pause", "Pause/Resume"),
         ("s", "save", "Save progress"),
+        ("b", "toggle_board", "Toggle board"),
     ]
 
     def __init__(
@@ -125,6 +109,8 @@ class TournamentApp(App):
         resume_completed: Optional[list[tuple[str, str, str]]] = None,
         resume_elo: Optional[dict] = None,
         openings_mode: str = "standard",
+        schedule: list[ScheduledGame] | None = None,
+        checkpoint_path: str = STATE_FILE,
     ):
         super().__init__()
         self.models = models
@@ -134,24 +120,24 @@ class TournamentApp(App):
         self.player_kwargs = player_kwargs
         self.max_workers = max_workers
         self.openings_mode = openings_mode
+        self.checkpoint_path = checkpoint_path
 
-        # Resume state (pre-seeded results from a previous run)
-        self._resume_completed = resume_completed or []
         self._resume_elo = resume_elo or {}
-
-        # State
-        self._completed: list[tuple[str, str, str]] = []
-        self._active: dict[int, tuple[str, str, float]] = {}
-        self._results_queue: queue.Queue = queue.Queue()
-        self._task_list: list[tuple[str, str]] = []
-        self._total_tasks = 0
-        self._start_time = 0.0
-        self._paused = False
-        self._finished = False
-        self._stop_flag = threading.Event()
         self.elo = ELOComputer()
-        self._task_id = 0
-        self._lock = threading.Lock()
+        self.runner = TournamentRunner(
+            models, games_per_pair, delay, max_workers, player_kwargs, self.elo,
+            resume_completed=resume_completed, openings_mode=openings_mode, schedule=schedule,
+        )
+        self._tournament_started_at = 0.0
+        self._paused = False
+        self._completion_reported = False
+        self._show_board = True
+        self._last_board_fen: str | None = None
+        self._last_game_info = ""
+        # Games finished in this session but not yet written to elo_db_path.
+        # The ratings file is the source of truth: these are replayed onto it,
+        # never a whole-dict snapshot (which would erase newer ratings).
+        self._unsaved_games: list[tuple[str, str, str]] = []
 
     # ── Compose ──────────────────────────────────────────────────────────
 
@@ -160,209 +146,108 @@ class TournamentApp(App):
         with Vertical(id="progress-section"):
             yield Label("", id="progress-label")
             yield ProgressBar(id="progress-bar", total=100, show_eta=False)
-        yield Static("", id="active-games")
-        yield DataTable(id="elo-table", cursor_type="row")
-        yield Static("", id="matchup-summary")
+        with Horizontal(id="dashboard"):
+            with Vertical():
+                yield Static("", id="active-games")
+                yield DataTable(id="elo-table", cursor_type="row")
+                yield Static("", id="matchup-summary")
+            with Vertical(id="board-panel"):
+                yield BoardWidget(id="board-view")
+                yield Static("", id="board-game-label")
         yield RichLog(id="worker-log", max_lines=20, highlight=True, markup=True)
         yield Footer()
 
     # ── Mount ────────────────────────────────────────────────────────────
 
     def on_mount(self):
-        # Pre-load resume data into ELO computer
-        if self._resume_elo:
+        # The live ratings file wins; the checkpoint snapshot is only a display
+        # fallback when ELO is not persisted.
+        if not self.elo_db_path and self._resume_elo:
             self.elo.ratings = self._resume_elo
-
-        # Load existing ratings from disk so ELO accumulates across tournaments
-        if self.elo_db_path:
+        elif self.elo_db_path:
             loaded = self.elo.load_existing(self.elo_db_path)
             if loaded:
                 self._tui_log(f"📂 Loaded {loaded} existing ratings from {self.elo_db_path}")
 
-        # Build remaining task list (skipping already-completed)
-        self._task_list = compute_remaining_tasks(
-            self.models, self.games_per_pair, self._resume_completed
-        )
-        self._completed = list(self._resume_completed)
-        self._total_tasks = len(self._task_list) + len(self._resume_completed)
-        self._start_time = time.time()
-
-        # Setup ELO table columns
-        elo_table = self.query_one("#elo-table", DataTable)
-        elo_table.add_columns("#", "Player", "ELO", "G", "W", "L", "D")
-
-        # Show resume info
-        if self._resume_completed:
-            self.notify(
-                f"Resumed with {len(self._resume_completed)} completed games, "
-                f"{len(self._task_list)} remaining",
-                title="📂 Resume"
-            )
-
+        self._tournament_started_at = time.time()
+        self._initial_completed = len(self.runner.completed)
+        self.query_one("#elo-table", DataTable).add_columns("#", "Player", "ELO", "G", "W", "L", "D")
         self._tui_log(f"⚙ Tournament: {len(self.models)} players, "
-                      f"{self._total_tasks} tasks, {self.max_workers} workers")
-        self._tui_log(f"📋 Task list: {len(self._task_list)} to run, "
-                      f"{len(self._resume_completed)} already done")
-        self._tui_log("🔧 Starting worker thread...")
-
-        # Start workers
+                      f"{self.runner.total_tasks} tasks, {self.max_workers} workers")
+        if self._initial_completed:
+            self.notify(f"Resumed with {self._initial_completed} completed games", title="📂 Resume")
         self._start_workers()
-        # Poll for results every 200ms
-        self.set_interval(0.2, self._poll)
-
-    # ── Thread-safe TUI logging ─────────────────────────────────────────
+        self._poll_timer = self.set_interval(0.2, self._poll)
 
     def _tui_log(self, msg: str):
-        """Log a message to the visible RichLog widget (thread-safe)."""
-        log_widget = self.query_one("#worker-log", RichLog)
-        log_widget.write(msg)
-
-    def _tui_log_safe(self, msg: str):
-        """Post a log message from any thread."""
-        self.call_from_thread(self._tui_log, msg)
-
-    # ── Worker management ────────────────────────────────────────────────
+        self.query_one("#worker-log", RichLog).write(Text(msg))
 
     @work(thread=True)
     def _start_workers(self):
-        """Run tournament games using ThreadPoolExecutor for true parallelism.
-
-        Each game runs in its own thread. Results go onto a queue and are
-        drained by the Textual poll loop. The max_workers cap limits how many
-        games run at once — set by --parallel.
-        """
-        self._tui_log_safe(f"[worker] Starting tournament with {self.max_workers} workers")
-
-        # Pre-load openings if needed
-        openings_list = None
-        if self.openings_mode == "unbalanced":
-            from openings import OPENINGS
-            openings_list = OPENINGS
-            import chess as _chess
-
-        _opening_idx = [0]  # list for mutable closure capture
-        _opening_lock = threading.Lock()
-
-        def _get_opening():
-            if openings_list is None:
-                return None, ""
-            with _opening_lock:
-                idx = _opening_idx[0]
-                _opening_idx[0] += 1
-            name, moves, advantage = openings_list[idx % len(openings_list)]
-            board = _chess.Board()
-            for uci in moves:
-                board.push_uci(uci)
-            return board, name
-
-        if not self._task_list:
-            self._finished = True
-            self._tui_log_safe("[worker] No tasks — exiting")
-            return
-
-        self._tui_log_safe(f"[worker] {len(self._task_list)} tasks, "
-                          f"{self.max_workers} parallel workers")
-
-        # Resolve run_match once
-        import sys
-        _mod = sys.modules.get("__main__")
-        if _mod is not None and hasattr(_mod, "run_match"):
-            _run_match_fn = _mod.run_match
-        else:
-            from tournament import run_match as _run_match_fn
-        self._tui_log_safe(f"[worker] run_match resolved: {_run_match_fn}")
-
-        # ── Thread-safe task dispatch ──────────────────────────────────
-        import concurrent.futures
-        _idx_counter = [0]
-
-        def _run_one(wm: str, bm: str):
-            """Run a single game and put result on queue."""
-            idx = _idx_counter[0]
-            _idx_counter[0] += 1
-
-            with self._lock:
-                tid = self._task_id
-                self._task_id += 1
-                self._active[tid] = (wm, bm, time.time())
-
-            board, oname = _get_opening()
-            try:
-                import io
-                old_stdout = sys.stdout
-                sys.stdout = io.StringIO()
-                try:
-                    result = _run_match_fn(
-                        wm, bm,
-                        delay=self.delay, elo_tracker=None,
-                        starting_board=board, opening_name=oname,
-                        **self.player_kwargs,
-                    )
-                finally:
-                    sys.stdout = old_stdout
-                self._results_queue.put((wm, bm, result))
-            except Exception as e:
-                self._tui_log_safe(f"[worker] Task {idx} FAILED: {e}")
-                self._results_queue.put((wm, bm, "error"))
-            finally:
-                with self._lock:
-                    self._active.pop(tid, None)
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.max_workers
-        ) as executor:
-            futures = []
-            for wm, bm in self._task_list:
-                if self._stop_flag.is_set():
-                    break
-                futures.append(executor.submit(_run_one, wm, bm))
-
-            # Wait for all futures to complete
-            for future in concurrent.futures.as_completed(futures):
-                if self._stop_flag.is_set():
-                    break
-                try:
-                    future.result()  # catch any unhandled exceptions
-                except Exception:
-                    pass
-
-        self._finished = True
-        self._tui_log_safe("[worker] All tasks complete")
-
-    # ── Polling ──────────────────────────────────────────────────────────
+        self.runner.start()
 
     def _poll(self):
-        """Drain result queue and update dashboard."""
-        # Drain queue
-        while not self._results_queue.empty():
-            try:
-                white, black, result = self._results_queue.get_nowait()
-                self._completed.append((white, black, result))
-                if result != "error":
-                    w_id = _elo_id(white)
-                    b_id = _elo_id(black)
-                    self.elo.add_game(w_id, b_id, result)
-            except queue.Empty:
-                break
+        """Drain worker events and refresh the dashboard."""
+        self.runner.process_moves()
+        finished = self.runner.is_finished()
+        new_results = False
+        for white, black, result, _, fen, _ in self.runner.process_results():
+            if result == "error":
+                self._tui_log(f"Game failed: {white} vs {black}")
+                continue
+            self._unsaved_games.append((white, black, result))
+            new_results = True
+            if fen:
+                self._last_board_fen = fen
+                self._last_game_info = f"{white} vs {black} · {result}"
+        if new_results and not self.runner.is_complete():
+            # Persist after every finished game so a crash cannot replay it.
+            self._save_elo()
+            self._save_checkpoint()
 
         self._update_progress()
         self._update_active_games()
         self._update_elo_table()
         self._update_matchup_summary()
+        self._refresh_board()
 
-        if self._finished and len(self._completed) >= self._total_tasks:
+        if finished and self.runner.is_complete() and not self._completion_reported:
+            self._completion_reported = True
             self._on_complete()
+
+    def _refresh_board(self):
+        panel = self.query_one("#board-panel", Vertical)
+        panel.display = self._show_board
+        if not self._show_board:
+            return
+        live = self.runner.latest_live_state()
+        if live is None:
+            self._update_board()
+            return
+        board, san, white, black, _, _ = live
+        self.query_one("#board-view", BoardWidget).update_state(
+            board=board, last_move=board.peek() if board.move_stack else None,
+        )
+        self.query_one("#board-game-label", Static).update(Text(f"{white} vs {black} · {san}"))
+
+    def _update_board(self):
+        """Display the last completed position when there is no live game."""
+        if not self._show_board or self.runner.latest_live_state() is not None:
+            return
+        board = chess.Board(self._last_board_fen) if self._last_board_fen else chess.Board()
+        self.query_one("#board-view", BoardWidget).update_state(board=board)
+        self.query_one("#board-game-label", Static).update(Text(self._last_game_info))
 
     # ── Widget updates ───────────────────────────────────────────────────
 
     def _update_progress(self):
-        done = len(self._completed)
-        total = self._total_tasks
+        done = len(self.runner.completed)
+        total = self.runner.total_tasks
         pct = done * 100 // total if total > 0 else 0
-        elapsed = time.time() - self._start_time
+        elapsed = time.time() - self._tournament_started_at
 
-        if done > 0 and not self._finished:
-            eta = elapsed / (done - len(self._resume_completed)) * (total - done) if done > len(self._resume_completed) else 0
+        if done > self._initial_completed and not self.runner.is_finished():
+            eta = elapsed / (done - self._initial_completed) * (total - done)
             eta_str = f"{eta:.0f}s" if eta < 120 else f"{eta/60:.1f}m"
         else:
             eta_str = "..."
@@ -370,8 +255,10 @@ class TournamentApp(App):
         elapsed_str = f"{elapsed:.0f}s" if elapsed < 120 else f"{elapsed/60:.1f}m"
 
         label = self.query_one("#progress-label", Label)
-        status = "🏁 Complete!" if self._finished else "⚡ Running"
-        if self._paused:
+        status = "⚡ Running"
+        if self.runner.is_finished():
+            status = "🏁 Complete!  Press q to quit." if self.runner.is_complete() else "Games unfinished"
+        elif self._paused:
             status = "⏸ Paused"
         label.update(
             f"  {status}  [{done}/{total}] {pct}%  "
@@ -384,14 +271,13 @@ class TournamentApp(App):
 
     def _update_active_games(self):
         active = self.query_one("#active-games", Static)
-        if not self._active:
+        items = list(self.runner.active_snapshot().values())
+        if not items:
             active.update("  No active games.")
             return
 
         lines = ["  ▶ Live games:"]
-        with self._lock:
-            items = list(self._active.items())
-        for tid, (wm, bm, started) in items[:8]:
+        for wm, bm, started in items[:8]:
             elapsed = time.time() - started
             lines.append(f"    {wm}  vs  {bm}   ···  {elapsed:.0f}s")
         if len(items) > 8:
@@ -401,7 +287,6 @@ class TournamentApp(App):
     def _update_elo_table(self):
         table = self.query_one("#elo-table", DataTable)
         table.clear()
-        table.add_columns("#", "Player", "ELO", "G", "W", "L", "D")
 
         board = self.elo.leaderboard()
         for i, (pid, stats) in enumerate(board[:20], 1):
@@ -416,12 +301,12 @@ class TournamentApp(App):
 
     def _update_matchup_summary(self):
         widget = self.query_one("#matchup-summary", Static)
-        if not self._completed:
+        if not self.runner.completed:
             widget.update("")
             return
 
         summary: dict[str, dict[str, int]] = {}
-        for wm, bm, result in self._completed:
+        for wm, bm, result in self.runner.completed:
             wid = _elo_id(wm)
             bid = _elo_id(bm)
             for pid in (wid, bid):
@@ -448,20 +333,19 @@ class TournamentApp(App):
         widget.update("\n".join(lines))
 
     def _save_elo(self):
-        """Save accumulated ELO ratings to disk.
+        """Apply this session's unsaved games to the live ratings file.
 
-        Since we loaded existing ratings at startup and accumulated new games
-        in-memory, self.elo.ratings already contains the correct merged data
-        (old ratings + new games). Just write it out.
+        Reloads the file and replays only the new games, so ratings written by
+        other runs since this one started are kept, and each game counts once.
         """
-        if self.elo_db_path and self.elo.ratings:
-            from elo import EloTracker
-            tracker = EloTracker(self.elo_db_path)
-            # Replace tracker's in-memory dict with our accumulated data
-            tracker._ratings = self.elo.ratings
-            tracker._save()
-            return True
-        return False
+        if not self.elo_db_path or not self._unsaved_games:
+            return False
+        from elo import EloTracker, player_id
+        tracker = EloTracker(self.elo_db_path)
+        for white, black, result in self._unsaved_games:
+            tracker.update(player_id(white), player_id(black), result)
+        self._unsaved_games.clear()
+        return True
 
     def _on_complete(self):
         """Tournament finished — show final state and save ELO."""
@@ -470,35 +354,54 @@ class TournamentApp(App):
         )
         if self._save_elo():
             self.notify(f"ELO saved to {self.elo_db_path}", title="✅ Done")
-        clear_state()
+        clear_state(self.checkpoint_path)
 
     # ── Actions ──────────────────────────────────────────────────────────
 
     def action_quit(self):
         """Quit: save ELO, stop workers, then exit."""
-        self._stop_flag.set()
+        self._poll_timer.stop()
+        self.runner.stop()
         # Drain any remaining results
         self._poll()
-        if not self._finished:
+        if not self.runner.is_complete():
+            self.action_save()
             self._save_elo()
-            clear_state()
         self.exit()
 
     def action_toggle_pause(self):
         self._paused = not self._paused
+        if self._paused:
+            self.runner.pause()
+        else:
+            self.runner.resume()
         self.notify("Paused" if self._paused else "Resumed")
+
+    def action_toggle_board(self):
+        self._show_board = not self._show_board
+        self._refresh_board()
 
     def action_save(self):
         """Save tournament progress to disk for later resume."""
-        path = save_state(
+        self._poll()
+        if self.runner.is_complete():
+            return
+        self._save_elo()
+        path = self._save_checkpoint()
+        self.notify(f"Saved {len(self.runner.completed)} games to {path}", title="💾 Saved")
+
+    def _save_checkpoint(self):
+        return save_state(
             models=self.models,
             games_per_pair=self.games_per_pair,
             delay=self.delay,
             max_workers=self.max_workers,
             player_kwargs=self.player_kwargs,
-            completed=self._completed,
+            completed=self.runner.completed,
             elo_ratings=self.elo.ratings,
             elo_db_path=self.elo_db_path,
-            started_at=self._start_time,
+            started_at=self._tournament_started_at,
+            openings_mode=self.openings_mode,
+            remaining_games=self.runner.remaining_games(),
+            path=self.checkpoint_path,
         )
-        self.notify(f"Saved {len(self._completed)} games to {path}", title="💾 Saved")

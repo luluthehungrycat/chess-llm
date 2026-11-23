@@ -25,6 +25,33 @@ DEFAULT_RATING = 1200
 PROVISIONAL_GAMES = 10    # games before switching from provisional K
 
 
+def player_id(spec: str, *, default_skill: int = 20) -> str:
+    """Return the shared ELO key for a player spec without creating a player."""
+    from model_config import resolve_model_spec
+
+    spec = spec.strip()
+    try:
+        spec, _ = resolve_model_spec(spec)
+    except ValueError:
+        return spec
+    low = spec.lower()
+    if low == "random":
+        return "random"
+    if low == "human":
+        return "human-Human"
+    if low.startswith("human:"):
+        return f"human-{spec.split(':', 1)[1].strip()}"
+    if low == "stockfish":
+        return f"stockfish-{default_skill}"
+    if low.startswith(("stockfish:", "stockfish-")):
+        suffix = spec[len("stockfish"):].lstrip("-:").strip()
+        if suffix == "":
+            return f"stockfish-{default_skill}"
+        if suffix.isdigit():
+            return f"stockfish-{int(suffix)}"
+    return spec
+
+
 class EloTracker:
     """Persistent ELO ratings for chess players (models, humans, engines)."""
 
@@ -36,11 +63,15 @@ class EloTracker:
     # ── persistence ──────────────────────────────────────────────────────
 
     def _load(self):
+        if self.db_path == ":memory:":
+            return
         if os.path.exists(self.db_path):
             with open(self.db_path) as f:
                 self._ratings = json.load(f)
 
     def _save(self):
+        if self.db_path == ":memory:":
+            return
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         with open(self.db_path, "w") as f:
             json.dump(self._ratings, f, indent=2)
@@ -63,7 +94,18 @@ class EloTracker:
 
         result: "1-0" (white wins), "0-1" (black wins), "1/2-1/2" (draw)
         Returns the two new rating entries as a dict.
+
+        Self-play (same id on both sides, e.g. random vs random) carries no
+        rating information: it is left unrated and returned with
+        ``skipped=True`` instead of raising, so callers that already saved
+        the game don't crash afterwards.
         """
+        if result not in ("1-0", "0-1", "1/2-1/2"):
+            raise ValueError(f"Unknown game result: {result!r}")
+        if white_id == black_id:
+            entry = self.get(white_id)
+            return {"white": entry, "black": entry, "skipped": True}
+
         w = self.get(white_id)
         b = self.get(black_id)
 
@@ -87,7 +129,7 @@ class EloTracker:
 
         # New ratings
         w_new = round(w_rating + w_k * (w_score - w_expected))
-        b_new = round(b_rating + b_k * (b_score - w_expected))
+        b_new = round(b_rating + b_k * (b_score - b_expected))
 
         # Update stats
         w["rating"] = w_new
